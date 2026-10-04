@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+
+module = DM_MOTOR
+module-str = dm_motor
+source "subsys/logging/Kconfig.template.log_config"
+
+source "Kconfig.zephyr"

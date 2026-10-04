@@ -1,0 +1,13 @@
+Treat the toolchain's own include directories (newlib, libstdc++, gcc) as
+system headers so that -Wundef / -Wall do not report warnings inside them.
+--- a/toolchain/config.bzl
++++ b/toolchain/config.bzl
+@@ -102,7 +102,7 @@
+                     ACTION_NAMES.clif_match,
+                 ],
+                 flag_groups = [
+-                    flag_group(flags = ["-I" + include.path for include in ctx.files.include_path]),
++                    flag_group(flags = [f for include in ctx.files.include_path for f in ("-isystem", include.path)]),
+                     flag_group(flags = ctx.attr.copts + default_compiler_flags),
+                 ],
+             ),

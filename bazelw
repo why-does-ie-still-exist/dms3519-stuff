@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Bazel wrapper: runs bazelisk (which honours .bazelversion), downloading a
+# pinned bazelisk into .cache/ if it is not already on PATH.
+set -euo pipefail
+
+BAZELISK_VERSION="1.29.0"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cache="${root}/.cache/bazelw"
+bin="${cache}/bazelisk-${BAZELISK_VERSION}"
+
+if [ ! -x "$bin" ]; then
+  if command -v bazelisk >/dev/null 2>&1; then
+    exec bazelisk "$@"
+  fi
+  case "$(uname -s)-$(uname -m)" in
+    Darwin-arm64)  asset="bazelisk-darwin-arm64" ;;
+    Darwin-x86_64) asset="bazelisk-darwin-amd64" ;;
+    Linux-x86_64)  asset="bazelisk-linux-amd64" ;;
+    Linux-aarch64) asset="bazelisk-linux-arm64" ;;
+    *) echo "bazelw: unsupported host $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+  esac
+  url="https://github.com/bazelbuild/bazelisk/releases/download/v${BAZELISK_VERSION}/${asset}"
+  echo "bazelw: downloading ${url}" >&2
+  mkdir -p "$cache"
+  curl -fsSL -o "${bin}.tmp" "$url"
+  chmod +x "${bin}.tmp"
+  mv "${bin}.tmp" "$bin"
+fi
+exec "$bin" "$@"

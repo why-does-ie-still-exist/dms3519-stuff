@@ -1,0 +1,30 @@
+[project]
+name = "canbed-m4"
+version = "0.1.0"
+description = "Zephyr firmware for the Longan Labs CANBed M4 driving DaMiao motors"
+requires-python = ">=3.12,<3.13"
+# west, pyserial (tools/console.py), psutil (west flash uf2 runner) and Zephyr
+# 4.4's scripts/requirements-base.txt.  Use: uv run west build -d build/zephyr app
+dependencies = [
+    'anytree',
+    'canopen',
+    'intelhex',
+    'jsonschema',
+    'packaging',
+    'patool>=2.0.0',
+    'psutil>=5.6.6',
+    'pyelftools>=0.29',
+    'pykwalify',
+    'pylink-square',
+    'pyserial>=3.5',
+    'PyYAML>=6.0',
+    'requests>=2.32.4',
+    'reuse>=6.0.0',
+    'semver',
+    'tqdm>=4.67.1',
+    'west>=1.5',
+    'windows-curses; sys_platform == "win32"',
+]
+
+[tool.uv]
+package = false

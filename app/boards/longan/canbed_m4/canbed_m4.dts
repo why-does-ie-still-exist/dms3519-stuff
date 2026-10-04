@@ -1,0 +1,104 @@
+/*
+ * Longan Labs CANBed M4: ATSAME51G19A (Cortex-M4F, 512 KiB flash, 192 KiB RAM)
+ * with an MCP2542FD CAN FD transceiver, USB, and a 16 KiB UF2 bootloader.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/dts-v1/;
+#include <atmel/same5xx19.dtsi>
+#include <zephyr/dt-bindings/gpio/gpio.h>
+#include "canbed_m4-pinctrl.dtsi"
+
+/ {
+	model = "Longan Labs CANBed M4";
+	compatible = "longan,canbed-m4";
+
+	chosen {
+		zephyr,console = &cdc_acm_uart0;
+		zephyr,shell-uart = &cdc_acm_uart0;
+		zephyr,sram = &sram0;
+		zephyr,flash = &flash0;
+		zephyr,code-partition = &code_partition;
+		zephyr,canbus = &can0;
+	};
+
+	aliases {
+		led0 = &led0;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		/* D5, blue, active high (Arduino D13) */
+		led0: led_0 {
+			gpios = <&porta 7 GPIO_ACTIVE_HIGH>;
+			label = "LED";
+		};
+	};
+};
+
+&cpu0 {
+	clock-frequency = <120000000>;
+};
+
+/* Serial1 (Grove J11 / header J12) */
+&sercom3 {
+	status = "okay";
+	compatible = "atmel,sam0-uart";
+	current-speed = <115200>;
+	rxpo = <1>;
+	txpo = <0>;
+	pinctrl-0 = <&sercom3_uart_default>;
+	pinctrl-names = "default";
+};
+
+&can0 {
+	status = "okay";
+	pinctrl-0 = <&can0_default>;
+	pinctrl-names = "default";
+	bitrate = <1000000>;
+	sample-point = <875>;
+	bitrate-data = <2000000>;
+	sample-point-data = <750>;
+};
+
+zephyr_udc0: &usb0 {
+	status = "okay";
+	pinctrl-0 = <&usb_dc_default>;
+	pinctrl-names = "default";
+
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};
+
+&dmac {
+	status = "okay";
+};
+
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		boot_partition: partition@0 {
+			label = "uf2";
+			reg = <0x00000000 DT_SIZE_K(16)>;
+			read-only;
+		};
+
+		code_partition: partition@4000 {
+			label = "code";
+			reg = <0x4000 DT_SIZE_K(512-16-16)>;
+			read-only;
+		};
+
+		/* last 16 KiB free for NVS/LittleFS if wanted */
+		storage_partition: partition@7c000 {
+			label = "storage";
+			reg = <0x7c000 DT_SIZE_K(16)>;
+		};
+	};
+};

@@ -1,0 +1,5 @@
+common --enable_bzlmod
+build --incompatible_enable_cc_toolchain_resolution
+# Cross-compile for the board by default.
+build --platforms=//bazel/platform:canbed_m4
+build -c dbg

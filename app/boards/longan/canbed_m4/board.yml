@@ -1,0 +1,6 @@
+board:
+  name: canbed_m4
+  full_name: CANBed M4
+  vendor: longan
+  socs:
+    - name: same51g19a

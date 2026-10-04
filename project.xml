@@ -1,0 +1,24 @@
+<library>
+  <repositories>
+    <repository><path>ext/modm/repo.lb</path></repository>
+  </repositories>
+
+  <!-- Longan Labs CANBed M4: ATSAME51G19A in QFN48 -->
+  <options>
+    <option name="modm:target">same51g19a-mu</option>
+    <option name="modm:build:project.name">canbed_m4</option>
+    <option name="modm:build:build.path">build</option>
+    <!-- 16 KiB UF2/SAM-BA bootloader lives at 0x0000; the app starts at 0x4000 -->
+    <option name="modm:platform:cortex-m:linkerscript.flash_offset">0x4000</option>
+    <option name="modm:platform:cortex-m:main_stack_size">8192</option>
+  </options>
+
+  <modules>
+    <module>modm:platform:core</module>
+    <module>modm:platform:gclk</module>
+    <module>modm:platform:gpio</module>
+    <!-- Make generator is only used as a source of truth for compiler flags
+         (tools/modm_bazel.py turns modm/config.mk into modm/BUILD.bazel). -->
+    <module>modm:build:make</module>
+  </modules>
+</library>

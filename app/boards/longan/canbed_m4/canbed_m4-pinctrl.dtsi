@@ -1,0 +1,48 @@
+/*
+ * Pin multiplexing for the Longan Labs CANBed M4 (ATSAME51G19A, QFN48).
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <dt-bindings/pinctrl/same51g-pinctrl.h>
+
+&pinctrl {
+	/* Serial1 on the Grove connector / 2x9 header: PA17 TX, PA16 RX */
+	sercom3_uart_default: sercom3_uart_default {
+		group1 {
+			pinmux = <PA17D_SERCOM3_PAD0>,
+				 <PA16D_SERCOM3_PAD1>;
+		};
+	};
+
+	/* I2C on the Grove connector: PA12 SDA, PA13 SCL */
+	sercom2_i2c_default: sercom2_i2c_default {
+		group1 {
+			pinmux = <PA12C_SERCOM2_PAD0>,
+				 <PA13C_SERCOM2_PAD1>;
+		};
+	};
+
+	/* SPI header J8: PA00 MOSI, PA01 SCK, PB23 MISO */
+	sercom1_spi_default: sercom1_spi_default {
+		group1 {
+			pinmux = <PA0D_SERCOM1_PAD0>,
+				 <PA1D_SERCOM1_PAD1>,
+				 <PB23C_SERCOM1_PAD3>;
+		};
+	};
+
+	/* CAN0 to the MCP2542FD transceiver (STBY tied low) */
+	can0_default: can0_default {
+		group1 {
+			pinmux = <PA22I_CAN0_TX>,
+				 <PA23I_CAN0_RX>;
+		};
+	};
+
+	usb_dc_default: usb_dc_default {
+		group1 {
+			pinmux = <PA25H_USB_DP>,
+				 <PA24H_USB_DM>;
+		};
+	};
+};

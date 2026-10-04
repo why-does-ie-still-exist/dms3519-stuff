@@ -1,0 +1,26 @@
+"""CANBed M4 (ATSAME51G19A) firmware — Bazel build."""
+
+module(name = "canbed_m4", version = "0.1.0")
+
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "rules_cc", version = "0.2.25")
+bazel_dep(name = "bazel_skylib", version = "1.9.0")
+bazel_dep(name = "toolchains_arm_gnu", version = "1.1.0")
+bazel_dep(name = "rules_shell", version = "0.8.0")
+
+# Make the toolchain's builtin include dirs -isystem instead of -I so modm's
+# -Wundef does not fire inside newlib/libstdc++ headers.
+single_version_override(
+    module_name = "toolchains_arm_gnu",
+    patch_strip = 1,
+    patches = ["//bazel/patches:toolchains_arm_gnu-isystem.patch"],
+)
+
+# Downloads the Arm GNU Toolchain (13.2.rel1 is the newest with an official
+# darwin-arm64 archive in toolchains_arm_gnu) into Bazel's cache.
+arm_toolchain = use_extension("@toolchains_arm_gnu//:extensions.bzl", "arm_toolchain")
+arm_toolchain.arm_none_eabi(version = "13.2.1")
+use_repo(arm_toolchain, "arm_none_eabi")
+
+# Only our Cortex-M4F toolchain (with the MCU flags baked in) is registered.
+register_toolchains("//bazel/toolchain:all")

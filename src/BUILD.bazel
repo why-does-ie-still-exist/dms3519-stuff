@@ -1,0 +1,56 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("//modm:flags.bzl", "MODM_CFLAGS", "MODM_CXXFLAGS", "modm_copts")
+
+# Application image.  The 16 KiB UF2 bootloader lives at 0x0000; modm's linker
+# script (modm:platform:cortex-m:linkerscript.flash_offset in project.xml)
+# places the app at 0x4000.
+cc_binary(
+    name = "firmware.elf",
+    srcs = [
+        "board.hpp",
+        "main.cpp",
+    ],
+    conlyopts = MODM_CFLAGS,
+    copts = modm_copts(),
+    cxxopts = MODM_CXXFLAGS,
+    features = ["generate_linkmap"],
+    deps = ["//modm"],
+)
+
+genrule(
+    name = "bin",
+    srcs = [":firmware.elf"],
+    outs = ["firmware.bin"],
+    cmd = "$(execpath @arm_none_eabi//:objcopy) -O binary $< $@",
+    tools = ["@arm_none_eabi//:objcopy"],
+)
+
+# Application start address in flash; must match linkerscript.flash_offset.
+APP_OFFSET = "0x4000"
+
+genrule(
+    name = "uf2",
+    srcs = [":firmware.bin"],
+    outs = ["firmware.uf2"],
+    cmd = "python3 $(location //tools:uf2conv.py) --family SAMD51 --base %s --convert --output $@ $<" % APP_OFFSET,
+    tools = [
+        "//tools:uf2conv.py",
+        "//tools:uf2families.json",
+    ],
+)
+
+# ./bazelw run //src:flash   — copies the UF2 to the bootloader drive (double-tap
+# RESET first if the board is not already showing the SAME51G19A drive).
+sh_binary(
+    name = "flash",
+    srcs = ["//tools:flash.sh"],
+    args = [
+        "$(rootpath :firmware.uf2)",
+        "$(rootpath :firmware.bin)",
+    ],
+    data = [
+        ":firmware.bin",
+        ":firmware.uf2",
+    ],
+)
