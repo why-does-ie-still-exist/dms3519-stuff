@@ -1,0 +1,50 @@
+diff --git a/soc/atmel/sam0/same51/Kconfig.soc b/soc/atmel/sam0/same51/Kconfig.soc
+index 4d858515..b0e59668 100644
+--- a/soc/atmel/sam0/same51/Kconfig.soc
++++ b/soc/atmel/sam0/same51/Kconfig.soc
+@@ -13,6 +13,10 @@ config SOC_SERIES_SAME51
+ config SOC_SERIES
+ 	default "same51" if SOC_SERIES_SAME51
+ 
++config SOC_SAME51G19A
++	bool
++	select SOC_SERIES_SAME51
++
+ config SOC_SAME51J18A
+ 	bool
+ 	select SOC_SERIES_SAME51
+@@ -34,6 +38,7 @@ config SOC_SAME51N20A
+ 	select SOC_SERIES_SAME51
+ 
+ config SOC
++	default "same51g19a" if SOC_SAME51G19A
+ 	default "same51j18a" if SOC_SAME51J18A
+ 	default "same51j19a" if SOC_SAME51J19A
+ 	default "same51j20a" if SOC_SAME51J20A
+diff --git a/soc/atmel/sam0/same51/soc.h b/soc/atmel/sam0/same51/soc.h
+index 8c55ceda..d3980268 100644
+--- a/soc/atmel/sam0/same51/soc.h
++++ b/soc/atmel/sam0/same51/soc.h
+@@ -15,7 +15,9 @@
+ #include <zephyr/types.h>
+ 
+ 
+-#if defined(CONFIG_SOC_SAME51J18A)
++#if defined(CONFIG_SOC_SAME51G19A)
++#include <same51g19a.h>
++#elif defined(CONFIG_SOC_SAME51J18A)
+ #include <same51j18a.h>
+ #elif defined(CONFIG_SOC_SAME51J19A)
+ #include <same51j19a.h>
+diff --git a/soc/atmel/sam0/soc.yml b/soc/atmel/sam0/soc.yml
+index d0cfa94f..f3139f32 100644
+--- a/soc/atmel/sam0/soc.yml
++++ b/soc/atmel/sam0/soc.yml
+@@ -85,6 +85,7 @@ family:
+     - name: samd51p20a
+   - name: same51
+     socs:
++    - name: same51g19a
+     - name: same51j18a
+     - name: same51j19a
+     - name: same51j20a

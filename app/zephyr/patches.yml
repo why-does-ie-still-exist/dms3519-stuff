@@ -1,0 +1,14 @@
+# Patches applied to the west workspace with: west patch apply
+# (west patch clean reverts them).  See zephyr/scripts/schemas/patch-schema.yml.
+patches:
+  - path: same51g19a-soc.patch
+    sha256sum: ea86384e0f6e4ddd8fd57b85a122057bca80bcf46f53c56ccae0695493670453
+    module: zephyr
+    author: Michael
+    email: legorocknxt@gmail.com
+    date: 2026-09-16
+    upstreamable: true
+    comments: |
+      Add the ATSAME51G19A (48-pin) to the SAME51 series: soc.yml, Kconfig.soc
+      and the device header include in soc.h.  The <same51g19a.h> CMSIS header
+      itself is not in hal_atmel; the app supplies it from app/include.
