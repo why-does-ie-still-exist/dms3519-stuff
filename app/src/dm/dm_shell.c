@@ -17,7 +17,10 @@ static uint16_t cur_mode = DM_ID_MIT;
  * The driver stops the motor (state D, comm loss) when it sees no command
  * within its TIMEOUT register, so velocity control must be sent continuously.
  */
-enum stream_kind { STREAM_VEL, STREAM_TORQUE };
+enum stream_kind { STREAM_VEL, STREAM_TORQUE, STREAM_SAFEVEL };
+
+/* Feedback older than this leaves the safevel loop open; it then commands 0. */
+#define DM_FB_STALE_MS 100
 
 static struct k_work_delayable stream_work;
 static uint32_t stream_period_ms;
@@ -31,6 +34,28 @@ static float tor_ramp = 1.0f; /* N.m per second, 0 = no ramp */
 static float kt_nm_per_a = 0.4537f; /* DaMiao selection table, output shaft */
 static float speed_cap = 20.0f;     /* rad/s at the output; torque is cut above this */
 static bool speed_tripped;
+/*
+ * Safe-velocity loop: velocity control whose torque saturates at a cap instead
+ * of tripping.  Gains are in N.m per rad/s and N.m per rad at the output
+ * shaft; the defaults are deliberately soft and expect tuning with
+ * 'dm velgains'.
+ */
+static struct dm_vel_pi vel_pi = {
+	.kp = 0.30f,
+	.ki = 1.00f,
+	.tor_max = 2.00f,
+	.deadband = DM_VEL_DEADBAND(DM_S3519_VMAX),
+};
+static bool svel_stale_warned;
+/*
+ * Idle means "commanding zero torque", as distinct from "regulating to zero
+ * rad/s".  'dm stop' idles: asking the loop to hold 0 rad/s instead would keep
+ * it fighting feedback quantisation around standstill, which is not what a
+ * stop should do.  Any 'dm vel' re-engages the loop.
+ */
+static bool svel_idle = true;
+/* Set once 'dm veldeadband' is used, so mode entry stops overriding it. */
+static bool svel_deadband_user;
 static uint32_t stream_count;
 static uint8_t last_state = 0xFF;
 
@@ -85,6 +110,35 @@ static void stream_fn(struct k_work *work)
 			tor = 0.0f;
 		}
 		(void)dm_motor_mit(&motor, 0.0f, 0.0f, 0.0f, 0.0f, tor);
+	} else if (stream_kind == STREAM_SAFEVEL) {
+		/*
+		 * Velocity loop closed here rather than in the driver, so the
+		 * torque it asks for can be clamped.  vel_current is the ramped
+		 * setpoint computed above.
+		 */
+		bool fresh = motor.fb.valid &&
+			     (k_uptime_get() - motor.fb.stamp) < DM_FB_STALE_MS;
+
+		if (svel_idle) {
+			/* Stopped: keep the frames flowing so the driver does
+			 * not declare comm loss, but ask for no torque at all.
+			 */
+			dm_vel_pi_reset(&vel_pi);
+			tor_current = 0.0f;
+		} else if (fresh) {
+			tor_current = dm_vel_pi_step(&vel_pi, vel_current, motor.fb.vel,
+						     (float)stream_period_ms / 1000.0f);
+			svel_stale_warned = false;
+		} else {
+			/* Open loop: command nothing rather than guess. */
+			dm_vel_pi_reset(&vel_pi);
+			tor_current = 0.0f;
+			if (!svel_stale_warned) {
+				printk("dm: no fresh feedback, safevel commanding 0 N.m\n");
+				svel_stale_warned = true;
+			}
+		}
+		(void)dm_motor_mit(&motor, 0.0f, 0.0f, 0.0f, 0.0f, tor_current);
 	} else {
 		(void)dm_motor_vel(&motor, vel_current);
 	}
@@ -272,10 +326,27 @@ static int cmd_vel(const struct shell *sh, size_t argc, char **argv)
 		return -EINVAL;
 	}
 	vel_setpoint = argf(argv[1]);
+	if (stream_kind == STREAM_SAFEVEL && svel_idle) {
+		/* Re-engage the loop after a stop, from a clean integrator. */
+		svel_idle = false;
+		dm_vel_pi_reset(&vel_pi);
+	}
 	if (stream_period_ms) {
-		shell_print(sh, "setpoint %.3f rad/s (streaming every %u ms)", (double)vel_setpoint,
-			    stream_period_ms);
+		if (stream_kind == STREAM_SAFEVEL) {
+			shell_print(sh, "setpoint %.3f rad/s, torque capped at %.2f N.m (every %u ms)",
+				    (double)vel_setpoint, (double)vel_pi.tor_max, stream_period_ms);
+		} else {
+			shell_print(sh, "setpoint %.3f rad/s (streaming every %u ms)",
+				    (double)vel_setpoint, stream_period_ms);
+		}
 		return 0;
+	}
+	if (stream_kind == STREAM_SAFEVEL) {
+		/* The loop only exists while streaming; a raw 0x200 frame would
+		 * also be wrong here because the driver is in MIT mode.
+		 */
+		shell_error(sh, "safevel needs the streamer: run 'dm safevelmode'");
+		return -EINVAL;
 	}
 	vel_current = vel_setpoint;
 	return dm_motor_vel(&motor, vel_setpoint);
@@ -294,7 +365,19 @@ static int cmd_stop(const struct shell *sh, size_t argc, char **argv)
 	vel_current = 0.0f;
 	tor_setpoint = 0.0f;
 	tor_current = 0.0f;
-	if (stream_kind == STREAM_TORQUE) {
+	if (stream_kind == STREAM_SAFEVEL) {
+		/*
+		 * Idle rather than regulate to 0 rad/s: holding a zero-speed
+		 * setpoint leaves the loop chasing feedback quantisation, which
+		 * shows up as jitter at standstill.  'dm vel 0' still asks for
+		 * an actively braked zero if that is what you want.
+		 */
+		svel_idle = true;
+		dm_vel_pi_reset(&vel_pi);
+		ret = dm_motor_mit(&motor, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+		shell_print(sh, "safevel stopped: 0 N.m, loop idle (%d); 'dm vel <rad/s>' resumes",
+			    ret);
+	} else if (stream_kind == STREAM_TORQUE) {
 		ret = dm_motor_mit(&motor, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
 		shell_print(sh, "torque setpoint 0: %d", ret);
 	} else {
@@ -422,6 +505,149 @@ static int cmd_torquemode(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+/*
+ * "Safe velocity" bring-up: velocity control with a saturating torque cap.
+ *
+ * The driver's own velocity mode (CTRL_MODE 3) will spend whatever torque it
+ * needs up to TMAX to hold the setpoint, so a jam is only ever caught by the
+ * driver's protections.  Here the velocity loop runs on the MCU instead: MIT
+ * frames with Kp = Kd = 0 carry a torque computed from the velocity error and
+ * clamped to 'dm torquecap'.
+ *
+ * Reaching the cap is a normal operating point, not a fault.  A stalled motor
+ * pushes at exactly the cap and keeps pushing; when the load is removed it
+ * accelerates and goes back to tracking the setpoint with no intervention.
+ */
+static int cmd_safevelmode(const struct shell *sh, size_t argc, char **argv)
+{
+	bool save = argc > 1 && !strcmp(argv[1], "save");
+	uint32_t hz = argc > 2 ? argu(argv[2]) : 100;
+	int ret;
+
+	if (need_motor(sh)) {
+		return -ENODEV;
+	}
+	stream_start(0);
+	vel_setpoint = 0.0f;
+	vel_current = 0.0f;
+	tor_setpoint = 0.0f;
+	tor_current = 0.0f;
+	dm_vel_pi_reset(&vel_pi);
+	svel_stale_warned = false;
+	/* Enter idle: entering the mode should not start regulating anything. */
+	svel_idle = true;
+
+	(void)dm_motor_disable(&motor, cur_mode);
+	k_sleep(K_MSEC(10));
+
+	/* The torque term is carried by a MIT frame, so the driver runs MIT. */
+	ret = dm_motor_write_reg(&motor, DM_RID_CMODE, DM_MODE_MIT, K_MSEC(200));
+	if (ret == -ETIMEDOUT) {
+		shell_warn(sh, "no reply to CTRL_MODE write (motor off or IDs wrong?), continuing");
+	} else if (ret) {
+		shell_error(sh, "CTRL_MODE write failed: %d", ret);
+		return ret;
+	}
+	if (save) {
+		k_sleep(K_MSEC(10));
+		ret = dm_motor_save_regs(&motor, K_MSEC(300));
+		shell_print(sh, "save: %d", ret);
+	}
+	cur_mode = DM_ID_MIT;
+	ret = enable_repeat(&motor, DM_ID_MIT);
+	if (ret) {
+		shell_error(sh, "enable failed: %d", ret);
+		return ret;
+	}
+	if (vel_pi.tor_max > motor.t_max) {
+		vel_pi.tor_max = motor.t_max;
+	}
+	/*
+	 * Size the deadband to the resolution the driver actually reports:
+	 * VMAX may differ from the default, and it sets the quantisation step.
+	 */
+	if (!svel_deadband_user) {
+		vel_pi.deadband = DM_VEL_DEADBAND(motor.v_max);
+	}
+	stream_kind = STREAM_SAFEVEL;
+	stream_start(hz ? 1000 / hz : 0);
+	shell_print(sh, "safe velocity mode: MIT on ID 0x%03x, streaming at %u Hz, ramp %.1f rad/s^2",
+		    DM_ID_MIT + motor.esc_id, hz, (double)vel_ramp);
+	shell_print(sh, "torque cap %.2f N.m (~%.2f A), gains kp %.3f ki %.3f, deadband %.3f rad/s",
+		    (double)vel_pi.tor_max, (double)(vel_pi.tor_max / kt_nm_per_a),
+		    (double)vel_pi.kp, (double)vel_pi.ki, (double)vel_pi.deadband);
+	shell_print(sh, "stalling is held at the cap, not tripped; speed returns when the load clears");
+	shell_print(sh, "idle until 'dm vel <rad/s>'; 'dm stop' returns to idle (0 N.m)");
+	return 0;
+}
+
+static int cmd_torquecap(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc > 1) {
+		float cap = argf(argv[1]);
+
+		if (cap < 0.0f) {
+			cap = 0.0f;
+		}
+		if (motor_ready && cap > motor.t_max) {
+			shell_warn(sh, "clamped to TMAX %.2f N.m", (double)motor.t_max);
+			cap = motor.t_max;
+		}
+		vel_pi.tor_max = cap;
+		dm_vel_pi_reset(&vel_pi);
+	}
+	shell_print(sh, "safevel torque cap = %.3f N.m (~%.2f A); the loop saturates here rather "
+		    "than cutting out", (double)vel_pi.tor_max,
+		    (double)(vel_pi.tor_max / kt_nm_per_a));
+	return 0;
+}
+
+static int cmd_velgains(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc > 1) {
+		vel_pi.kp = argf(argv[1]);
+	}
+	if (argc > 2) {
+		vel_pi.ki = argf(argv[2]);
+	}
+	if (argc > 1) {
+		dm_vel_pi_reset(&vel_pi);
+	}
+	shell_print(sh, "safevel gains: kp %.4f N.m per rad/s, ki %.4f N.m per rad",
+		    (double)vel_pi.kp, (double)vel_pi.ki);
+	return 0;
+}
+
+/*
+ * The feedback cannot express zero velocity (12 bits over +-VMAX puts zero at
+ * code 2047.5), so a stationary motor reports +-VMAX/4095 for ever.  Without a
+ * deadband that bias ratchets the integrator until it breaks stiction and the
+ * motor jitters.  Shrinking VMAX (RID 22) is the real cure; this bounds the
+ * damage at whatever VMAX is in use.
+ */
+static int cmd_veldeadband(const struct shell *sh, size_t argc, char **argv)
+{
+	float lsb = DM_VEL_LSB(motor_ready ? motor.v_max : DM_S3519_VMAX);
+
+	if (argc > 1) {
+		float db = argf(argv[1]);
+
+		if (db < 0.0f) {
+			db = 0.0f;
+		}
+		vel_pi.deadband = db;
+		svel_deadband_user = true;
+		dm_vel_pi_reset(&vel_pi);
+	}
+	shell_print(sh, "safevel deadband = %.4f rad/s (%.2f counts of %.4f); "
+		    "velocity error inside it is ignored", (double)vel_pi.deadband,
+		    (double)(vel_pi.deadband / lsb), (double)lsb);
+	if (vel_pi.deadband < lsb) {
+		shell_warn(sh, "below one count: standstill bias will still wind the integrator");
+	}
+	return 0;
+}
+
 static int set_torque(const struct shell *sh, float tor)
 {
 	if (tor > motor.t_max) {
@@ -504,7 +730,21 @@ static int cmd_status(const struct shell *sh, size_t argc, char **argv)
 	}
 	shell_print(sh, "esc 0x%03x mst 0x%03x frame-mode 0x%03x fd %s", motor.esc_id, motor.mst_id,
 		    cur_mode, motor.fd ? "on" : "off");
-	if (stream_kind == STREAM_TORQUE) {
+	if (stream_kind == STREAM_SAFEVEL) {
+		bool sat = vel_pi.tor_max > 0.0f &&
+			   (tor_current >= vel_pi.tor_max - 1e-4f ||
+			    tor_current <= -vel_pi.tor_max + 1e-4f);
+
+		shell_print(sh, "stream %s %u ms (safevel%s), sent %u, setpoint %.3f, sending %.3f rad/s",
+			    stream_period_ms ? "on" : "off", stream_period_ms,
+			    svel_idle ? ", IDLE" : "", stream_count,
+			    (double)vel_setpoint, (double)vel_current);
+		shell_print(sh, "torque %.3f N.m (~%.2f A) of %.2f cap%s, integ %.3f, kp %.3f ki %.3f, "
+			    "deadband %.3f rad/s", (double)tor_current,
+			    (double)(tor_current / kt_nm_per_a), (double)vel_pi.tor_max,
+			    sat ? " [AT CAP]" : "", (double)vel_pi.integ, (double)vel_pi.kp,
+			    (double)vel_pi.ki, (double)vel_pi.deadband);
+	} else if (stream_kind == STREAM_TORQUE) {
 		shell_print(sh, "stream %s %u ms (torque), sent %u, torque %.3f N.m (~%.2f A), sending %.3f, ramp %.1f N.m/s, cap %.1f rad/s%s",
 			    stream_period_ms ? "on" : "off", stream_period_ms, stream_count,
 			    (double)tor_setpoint, (double)(tor_setpoint / kt_nm_per_a), (double)tor_current,
@@ -743,7 +983,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD_ARG(mit, NULL, "<pos> <vel> <kp> <kd> <tor>: MIT frame", cmd_mit, 6, 0),
 	SHELL_CMD_ARG(pos, NULL, "<pos> <vel>: position-velocity frame", cmd_pos, 3, 0),
 	SHELL_CMD_ARG(vel, NULL, "<rad/s>: velocity setpoint (one frame, or continuous with stream)", cmd_vel, 2, 0),
-	SHELL_CMD(stop, NULL, "velocity/torque setpoint 0", cmd_stop),
+	SHELL_CMD(stop, NULL, "setpoint 0 (safevel: idle at 0 N.m until the next 'dm vel')", cmd_stop),
 	SHELL_CMD_ARG(torquemode, NULL, "[save] [hz]: MIT mode with Kp=Kd=0, stream the torque term", cmd_torquemode, 1, 2),
 	SHELL_CMD_ARG(torque, NULL, "<N.m>: torque (current) setpoint at the output shaft", cmd_torque, 2, 0),
 	SHELL_CMD_ARG(current, NULL, "<A>: current setpoint, converted to torque with Kt", cmd_current, 2, 0),
@@ -752,6 +992,10 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD_ARG(speedcap, NULL, "[rad/s]: runaway guard for torque mode (0 = off)", cmd_speedcap, 1, 1),
 	SHELL_CMD_ARG(stream, NULL, "[hz [ramp rad/s^2]]: stream the velocity setpoint (0 = off)", cmd_stream, 1, 2),
 	SHELL_CMD_ARG(velmode, NULL, "[save] [hz]: disable, CTRL_MODE=3, enable on 0x200+ID, stream", cmd_velmode, 1, 2),
+	SHELL_CMD_ARG(safevelmode, NULL, "[save] [hz]: velocity control with a saturating torque cap", cmd_safevelmode, 1, 2),
+	SHELL_CMD_ARG(torquecap, NULL, "[N.m]: show/set the safevel torque cap (saturates, no trip)", cmd_torquecap, 1, 1),
+	SHELL_CMD_ARG(velgains, NULL, "[kp] [ki]: show/set the safevel velocity-loop gains", cmd_velgains, 1, 2),
+	SHELL_CMD_ARG(veldeadband, NULL, "[rad/s]: velocity error the safevel loop ignores (quantisation)", cmd_veldeadband, 1, 1),
 	SHELL_CMD(status, NULL, "motor, streamer and feedback status", cmd_status),
 	SHELL_CMD_ARG(psi, NULL, "<pos> <vel> <cur>: force-position frame", cmd_psi, 4, 0),
 	SHELL_CMD_ARG(cur3519, NULL, "<m1> [m2] [m3] [m4]: DM3519 one-to-four current frame (A)", cmd_cur3519, 2, 3),

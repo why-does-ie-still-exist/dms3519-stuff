@@ -126,12 +126,126 @@ static void test_dm3519(void)
 	CHECK(fb.t_coil == 50.0f && fb.t_mos == 60.0f, "temps");
 }
 
+/* Safe-velocity loop: saturate at the cap, never trip, recover on unload. */
+static void test_vel_pi(void)
+{
+	const float dt = 0.01f; /* 100 Hz */
+	struct dm_vel_pi pi = {.kp = 0.3f, .ki = 1.0f, .tor_max = 2.0f};
+
+	/* Zero error holds zero torque. */
+	CHECK(fabsf(dm_vel_pi_step(&pi, 0.0f, 0.0f, dt)) < 1e-6f, "idle torque");
+
+	/* Stalled against a hard stop: measured velocity stays 0 while the
+	 * setpoint is 5 rad/s.  Torque must rise to the cap and stay there --
+	 * no cutout, however long the stall lasts.
+	 */
+	dm_vel_pi_reset(&pi);
+	float tor = 0.0f;
+
+	for (int i = 0; i < 1000; i++) { /* 10 s stalled */
+		tor = dm_vel_pi_step(&pi, 5.0f, 0.0f, dt);
+		CHECK(tor <= pi.tor_max + 1e-5f, "exceeded cap: %f", (double)tor);
+	}
+	CHECK(fabsf(tor - pi.tor_max) < 1e-5f, "stall should sit at the cap, got %f", (double)tor);
+	/* Anti-windup: the integrator must not have run away during the stall. */
+	CHECK(pi.integ <= pi.tor_max + 1e-5f, "integrator wound up to %f", (double)pi.integ);
+
+	/* Load removed: the motor reaches the setpoint, torque must back off
+	 * well below the cap rather than staying pinned.
+	 */
+	for (int i = 0; i < 200; i++) {
+		tor = dm_vel_pi_step(&pi, 5.0f, 5.0f, dt);
+	}
+	CHECK(tor < pi.tor_max, "torque stayed pinned after unload: %f", (double)tor);
+
+	/* Symmetry: reverse stall saturates at -cap. */
+	dm_vel_pi_reset(&pi);
+	for (int i = 0; i < 1000; i++) {
+		tor = dm_vel_pi_step(&pi, -5.0f, 0.0f, dt);
+		CHECK(tor >= -pi.tor_max - 1e-5f, "exceeded negative cap: %f", (double)tor);
+	}
+	CHECK(fabsf(tor + pi.tor_max) < 1e-5f, "reverse stall at -cap, got %f", (double)tor);
+
+	/* Overspeed produces braking torque, also capped. */
+	dm_vel_pi_reset(&pi);
+	tor = dm_vel_pi_step(&pi, 0.0f, 50.0f, dt);
+	CHECK(tor < 0.0f && tor >= -pi.tor_max - 1e-5f, "braking torque %f", (double)tor);
+
+	/* A cap of 0 means no torque -- never "unlimited". */
+	struct dm_vel_pi off = {.kp = 0.3f, .ki = 1.0f, .tor_max = 0.0f};
+
+	for (int i = 0; i < 100; i++) {
+		CHECK(fabsf(dm_vel_pi_step(&off, 5.0f, 0.0f, dt)) < 1e-6f, "cap 0 must give 0 N.m");
+	}
+}
+
+/*
+ * Standstill must not creep.  The 12-bit velocity field puts zero at code
+ * 2047.5, so a motionless motor reports +-VMAX/4095 for ever; without a
+ * deadband that constant bias winds the integrator up until the motor jitters.
+ */
+static void test_vel_pi_deadband(void)
+{
+	const float dt = 0.01f;
+	const float vmax = 200.0f;
+	const float lsb = DM_VEL_LSB(vmax);
+
+	/* Zero velocity really is unrepresentable: the two codes either side
+	 * of zero are both half a count away from it.
+	 */
+	float below = dm_uint_to_float(2047, -vmax, vmax, 12);
+	float above = dm_uint_to_float(2048, -vmax, vmax, 12);
+
+	CHECK(below < 0.0f && above > 0.0f, "codes straddle zero: %f %f", (double)below, (double)above);
+	CHECK(fabsf(fabsf(below) - lsb / 2.0f) < 1e-3f, "half a count below zero: %f", (double)below);
+
+	/* Without a deadband, that bias ratchets up -- the bug being fixed. */
+	struct dm_vel_pi raw = {.kp = 0.3f, .ki = 1.0f, .tor_max = 2.0f};
+	float tor = 0.0f;
+
+	for (int i = 0; i < 500; i++) { /* 5 s standing still */
+		tor = dm_vel_pi_step(&raw, 0.0f, below, dt);
+	}
+	CHECK(tor > 0.2f, "expected the un-deadbanded loop to wind up, got %f", (double)tor);
+
+	/* With the default deadband it stays put, whichever code is reported
+	 * and however long it sits there.
+	 */
+	struct dm_vel_pi pi = {
+		.kp = 0.3f, .ki = 1.0f, .tor_max = 2.0f, .deadband = DM_VEL_DEADBAND(vmax)};
+
+	for (int i = 0; i < 2000; i++) { /* 20 s, dithering between codes */
+		tor = dm_vel_pi_step(&pi, 0.0f, (i % 2) ? below : above, dt);
+		CHECK(fabsf(tor) < 1e-6f, "standstill torque %f at step %d", (double)tor, i);
+	}
+	CHECK(fabsf(pi.integ) < 1e-6f, "integrator drifted to %f at standstill", (double)pi.integ);
+
+	/* A real command still gets through: the deadband only removes its own
+	 * width from the error, it does not block motion.
+	 */
+	dm_vel_pi_reset(&pi);
+	tor = dm_vel_pi_step(&pi, 5.0f, 0.0f, dt);
+	CHECK(tor > 0.9f * pi.kp * (5.0f - pi.deadband), "real command blunted: %f", (double)tor);
+
+	/* And the response is continuous across the edge of the band. */
+	dm_vel_pi_reset(&pi);
+	float inside = dm_vel_pi_step(&pi, pi.deadband - 1e-4f, 0.0f, 0.0f);
+
+	dm_vel_pi_reset(&pi);
+	float outside = dm_vel_pi_step(&pi, pi.deadband + 1e-4f, 0.0f, 0.0f);
+
+	CHECK(fabsf(outside - inside) < 1e-3f, "step at the deadband edge: %f -> %f", (double)inside,
+	      (double)outside);
+}
+
 int main(void)
 {
 	test_float_uint_roundtrip();
 	test_mit_pack_layout();
 	test_feedback_unpack();
 	test_dm3519();
+	test_vel_pi();
+	test_vel_pi_deadband();
 	if (failures == 0) {
 		printf("dm_motor host tests: all passed\n");
 		return 0;

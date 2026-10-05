@@ -9,6 +9,64 @@
  * Pure helpers
  * ---------------------------------------------------------------------- */
 
+void dm_vel_pi_reset(struct dm_vel_pi *pi)
+{
+	pi->integ = 0.0f;
+}
+
+float dm_vel_pi_step(struct dm_vel_pi *pi, float vel_cmd, float vel_meas, float dt)
+{
+	/* The clamp is always active: a cap of 0 means no torque, never
+	 * "unlimited".  Set the cap to TMAX to effectively remove the limit.
+	 */
+	const float lim = pi->tor_max > 0.0f ? pi->tor_max : 0.0f;
+	const float db = pi->deadband > 0.0f ? pi->deadband : 0.0f;
+	/*
+	 * Shrink the error towards zero by the deadband rather than clipping
+	 * it, so there is no step in the response at the edge of the band.
+	 * Quantisation error then contributes nothing to either term.
+	 */
+	float err = vel_cmd - vel_meas;
+	const float prev = pi->integ;
+	float integ = prev;
+	float tor;
+
+	if (err > db) {
+		err -= db;
+	} else if (err < -db) {
+		err += db;
+	} else {
+		err = 0.0f;
+	}
+
+	if (dt > 0.0f) {
+		integ += pi->ki * err * dt;
+	}
+	/* Keep the integrator itself inside the clamp as a backstop. */
+	if (integ > lim) {
+		integ = lim;
+	} else if (integ < -lim) {
+		integ = -lim;
+	}
+
+	tor = pi->kp * err + integ;
+
+	if (tor > lim) {
+		tor = lim;
+		/* Saturated high: let the integrator fall, never climb further. */
+		if (integ > prev) {
+			integ = prev;
+		}
+	} else if (tor < -lim) {
+		tor = -lim;
+		if (integ < prev) {
+			integ = prev;
+		}
+	}
+	pi->integ = integ;
+	return tor;
+}
+
 uint32_t dm_float_to_uint(float x, float x_min, float x_max, unsigned int bits)
 {
 	float span = x_max - x_min;

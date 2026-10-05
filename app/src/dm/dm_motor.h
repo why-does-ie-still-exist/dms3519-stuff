@@ -248,6 +248,46 @@ int dm_motor_request_feedback(const struct dm_motor *m);
 
 /* --- pure packing helpers (host-testable, no Zephyr dependency) -------- */
 
+/*
+ * Velocity loop with a saturating torque limit ("safe velocity" control).
+ *
+ * A PI controller on velocity error whose output is clamped to +-tor_max.  The
+ * clamp is an operating point, not a fault: a stalled motor settles at exactly
+ * tor_max and pushes there indefinitely, and resumes tracking the velocity
+ * setpoint on its own once the load is removed.  That is the difference from
+ * the runaway guard used by torque mode, which cuts the command entirely.
+ *
+ * Integration is suspended while the output is clamped (conditional
+ * integration), so a long stall cannot wind the integrator up and cause a
+ * lurch when the load disappears.
+ *
+ * 'deadband' exists because the feedback cannot represent zero velocity: the
+ * 12-bit field maps +-VMAX onto 0..4095, so zero falls at code 2047.5 and a
+ * stationary motor always reports +-VMAX/4095 (0.049 rad/s at VMAX 200).  That
+ * constant apparent error would otherwise ratchet the integrator up until it
+ * breaks stiction, producing a slow jitter around standstill.  Error inside
+ * the band is treated as zero for both terms, by shrinking it towards zero
+ * rather than clipping, so the response stays continuous at the edge.  The
+ * integrator is held, not leaked, so steady-state holding torque survives.
+ */
+struct dm_vel_pi {
+	float kp;       /* N.m per rad/s of error */
+	float ki;       /* N.m per rad (i.e. per rad/s of error, per second) */
+	float tor_max;  /* N.m, symmetric clamp; 0 means no torque, not "unlimited" */
+	float deadband; /* rad/s of error ignored; 0 disables (see above) */
+	float integ;    /* state: the integrator's contribution, in N.m */
+};
+
+/** One count of feedback velocity, rad/s: the 12-bit field spans +-v_max. */
+#define DM_VEL_LSB(v_max) (2.0f * (v_max) / 4095.0f)
+/** Default deadband: one count of dither either side of the half-count offset. */
+#define DM_VEL_DEADBAND(v_max) (1.5f * DM_VEL_LSB(v_max))
+
+/** Advance the loop by dt seconds; returns the torque command in N.m. */
+float dm_vel_pi_step(struct dm_vel_pi *pi, float vel_cmd, float vel_meas, float dt);
+/** Clear the integrator (on mode entry, stop, or loss of feedback). */
+void dm_vel_pi_reset(struct dm_vel_pi *pi);
+
 uint32_t dm_float_to_uint(float x, float x_min, float x_max, unsigned int bits);
 float dm_uint_to_float(uint32_t x_int, float x_min, float x_max, unsigned int bits);
 void dm_pack_mit(uint8_t data[8], float pos, float vel, float kp, float kd, float tor,
