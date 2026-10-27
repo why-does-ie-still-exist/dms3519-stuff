@@ -97,10 +97,13 @@ static float kt_nm_per_a = 0.4537f; /* DaMiao selection table, output shaft; sha
 /* One heartbeat clock for all slots: the host is either alive or not. */
 static uint32_t hb_last_ms;
 /*
- * Single-motor lockout.  With several motors fed through one thin supply
- * lead, only one may be energised at a time: a command that would enable or
- * drive a motor is refused while another slot is energised or streaming.
- * 'dm lockout off' lifts it once the wiring can take the current.
+ * Single-motor lockout for everything except safe-velocity mode.  With
+ * several motors fed through one thin supply lead, the supply current is
+ * torque times speed, and only safevel bounds both (torque cap, runaway
+ * guard on the driver's own velocity).  So safevel may run on any number of
+ * motors, while a command that would energise a motor any other way (raw
+ * enable, velocity or torque mode, one-shot frames) is refused while another
+ * slot is energised or streaming.  'dm lockout off' lifts it.
  */
 static bool lockout = true;
 
@@ -488,9 +491,9 @@ static int need_motor(const struct shell *sh)
 }
 
 /*
- * Enforce the single-motor lockout for a command that would energise the
- * selected motor.  Returns 0 if allowed; otherwise prints which motor is in
- * the way and returns -EBUSY.
+ * Enforce the lockout for a command that would energise the selected motor
+ * outside safe-velocity mode.  Returns 0 if allowed; otherwise prints which
+ * motor is in the way and returns -EBUSY.
  */
 static int lockout_check(const struct shell *sh)
 {
@@ -504,8 +507,9 @@ static int lockout_check(const struct shell *sh)
 			continue;
 		}
 		if (s->energised || s->stream_period_ms) {
-			shell_error(sh, "lockout: motor esc 0x%03x is %s; one motor at a time "
-				    "('dm init 0x%x', 'dm disable', 'dm stream 0' first, or 'dm lockout off')",
+			shell_error(sh, "lockout: motor esc 0x%03x is %s; outside safevelmode only one "
+				    "motor may be energised ('dm init 0x%x' + 'dm disable'/'dm stream 0' "
+				    "first, use 'dm safevelmode', or 'dm lockout off')",
 				    s->m.esc_id, s->stream_period_ms ? "streaming" : "enabled",
 				    s->m.esc_id);
 			return -EBUSY;
@@ -801,8 +805,12 @@ static int cmd_pos(const struct shell *sh, size_t argc, char **argv)
 
 static int cmd_vel(const struct shell *sh, size_t argc, char **argv)
 {
-	if (need_motor(sh) || lockout_check(sh)) {
+	if (need_motor(sh)) {
 		return -ENODEV;
+	}
+	/* Setting the safevel loop's setpoint is exempt; a raw 0x200 frame is not. */
+	if (!(cur->stream_period_ms && cur->stream_kind == STREAM_SAFEVEL) && lockout_check(sh)) {
+		return -EBUSY;
 	}
 	if (argc != 2) {
 		shell_error(sh, "usage: dm vel <vel rad/s>   (streamed continuously if 'dm stream' is on)");
@@ -1039,7 +1047,7 @@ static int cmd_safevelmode(const struct shell *sh, size_t argc, char **argv)
 		cur->svel_runaway = false;
 	}
 
-	if (need_motor(sh) || lockout_check(sh)) {
+	if (need_motor(sh)) {
 		return -ENODEV;
 	}
 	stream_start(cur, 0);
@@ -1251,9 +1259,8 @@ static int cmd_lockout(const struct shell *sh, size_t argc, char **argv)
 			n++;
 		}
 	}
-	shell_print(sh, "single-motor lockout %s; %d motor(s) currently energised or streaming%s",
-		    lockout ? "ON" : "off", n,
-		    (lockout && n > 1) ? " (more than one: disable all but one)" : "");
+	shell_print(sh, "lockout %s (one motor at a time outside safevelmode); %d motor(s) energised "
+		    "or streaming", lockout ? "ON" : "off", n);
 	return 0;
 }
 
@@ -1919,7 +1926,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	dm_cmds,
 	SHELL_CMD_ARG(init, NULL, "<esc_id> [mst_id = esc+0x10] [pmax vmax tmax]: select a motor (set it up the first time)", cmd_init, 1, 5),
 	SHELL_CMD(motors, NULL, "list the motors in use and what each is doing", cmd_motors),
-	SHELL_CMD_ARG(lockout, NULL, "[on|off]: allow only one motor to be energised at a time (default on)", cmd_lockout, 1, 1),
+	SHELL_CMD_ARG(lockout, NULL, "[on|off]: outside safevelmode, only one motor may be energised (default on)", cmd_lockout, 1, 1),
 	SHELL_CMD_ARG(release, NULL, "[esc_id]: stop, disable and forget a motor", cmd_release, 1, 1),
 	SHELL_CMD_ARG(mode, NULL, "[mit|pos|vel|psi]: frame-ID mode used by enable/disable/zero", cmd_mode, 1, 1),
 	SHELL_CMD(enable, NULL, "enable motor (FF..FC)", cmd_enable),

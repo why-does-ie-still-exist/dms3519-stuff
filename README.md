@@ -94,12 +94,12 @@ it refuses to start if a stale `screen` still holds the port.
 
 ### Several motors at once
 
-**Single-motor lockout (default on).** While the motors share one thin supply
-lead, only one may be energised at a time: `dm enable`, the mode commands and
-the one-shot drive commands are refused while another slot is enabled or
-streaming, naming the motor in the way. `dm disable`, `dm stop` + `dm stream 0`
-or `dm release` on that motor clears it. `dm lockout off` lifts the rule once
-the wiring can carry the current; `dm lockout` shows the state.
+**Lockout outside safe-velocity mode (default on).** The supply current is
+torque times speed, and only `safevelmode` bounds both (torque cap, runaway
+guard on the driver's own velocity), so it may run on any number of motors.
+Any other way of energising a motor, `dm enable`, `velmode`, `torquemode` or a
+one-shot frame, is refused while another motor is enabled or streaming, naming
+the motor in the way. `dm lockout off` lifts the rule; `dm lockout` shows it.
 
 
 Each motor gets its own slot with its own control loop, so `dm init` is really
