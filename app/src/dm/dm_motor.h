@@ -180,6 +180,7 @@ struct dm_motor {
 	uint8_t last_rid;
 	uint32_t last_reg_raw;
 	struct k_sem reg_sem;
+	struct k_sem tx_sem;   /* TX completion for the bounded send */
 	int rx_filter_fb;
 	int rx_filter_3519;
 };

@@ -15,7 +15,26 @@ LOG_MODULE_REGISTER(dm_motor, CONFIG_DM_MOTOR_LOG_LEVEL);
  * Zephyr CAN glue
  * ---------------------------------------------------------------------- */
 
-static int send_frame(const struct device *can, bool fd, uint16_t id, const uint8_t *data, uint8_t len)
+/*
+ * A blocking can_send() (NULL callback) does not return until the frame is
+ * acknowledged, and the timeout only covers getting a mailbox.  With no other
+ * node answering that is for ever, which wedges whichever thread sent: the
+ * shell on a 'dm init', or the work queue running every motor loop.  So wait
+ * on a completion callback with a real bound instead.
+ */
+#define DM_TX_WAIT K_MSEC(10)
+
+static void tx_done(const struct device *dev, int error, void *user_data)
+{
+	struct k_sem *sem = user_data;
+
+	ARG_UNUSED(dev);
+	ARG_UNUSED(error);
+	k_sem_give(sem);
+}
+
+static int send_frame_bounded(const struct device *can, struct k_sem *sem, bool fd, uint16_t id,
+			      const uint8_t *data, uint8_t len)
 {
 	struct can_frame frame = {
 		.id = id,
@@ -24,15 +43,28 @@ static int send_frame(const struct device *can, bool fd, uint16_t id, const uint
 	};
 
 	memcpy(frame.data, data, len);
-	int ret = can_send(can, &frame, K_MSEC(20), NULL, NULL);
+	k_sem_reset(sem);
+	int ret = can_send(can, &frame, K_MSEC(5), tx_done, sem);
 
+	if (ret == 0 && k_sem_take(sem, DM_TX_WAIT) != 0) {
+		ret = -ETIMEDOUT;
+	}
 	if (ret != 0) {
 		LOG_WRN("send id 0x%03x failed: %d", id, ret);
 	}
 	return ret;
 }
 
-#define send_std(m, id, data, len) send_frame((m)->can, (m)->fd, (id), (data), (len))
+static K_SEM_DEFINE(bare_tx_sem, 0, 1);
+
+/* Frames not tied to a motor object (DM3519 one-to-four current). */
+static int send_frame(const struct device *can, bool fd, uint16_t id, const uint8_t *data, uint8_t len)
+{
+	return send_frame_bounded(can, &bare_tx_sem, fd, id, data, len);
+}
+
+#define send_std(m, id, data, len)                                                                   \
+	send_frame_bounded((m)->can, &((struct dm_motor *)(m))->tx_sem, (m)->fd, (id), (data), (len))
 
 static int send_cmd(const struct dm_motor *m, uint16_t mode_id, uint8_t last)
 {
@@ -328,6 +360,7 @@ int dm_motor_init(struct dm_motor *m, const struct device *can, uint16_t esc_id,
 	m->v_max = v_max;
 	m->t_max = t_max;
 	k_sem_init(&m->reg_sem, 0, 1);
+	k_sem_init(&m->tx_sem, 0, 1);
 
 	filter.id = mst_id;
 	ret = can_add_rx_filter(can, rx_feedback, m, &filter);

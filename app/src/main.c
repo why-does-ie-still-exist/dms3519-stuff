@@ -1,8 +1,8 @@
 /*
  * CANBed M4 CAN loopback self-test.
  *
- * Puts CAN0 into internal loopback (frames are transmitted, received by the
- * same controller, and also driven onto the bus pins), sends a classic
+ * Puts CAN0 into internal loopback (frames are transmitted and received by the
+ * same controller without reaching the bus pins), sends a classic
  * frame and a 64-byte CAN FD frame with bit-rate switching, and checks that
  * both come back intact.  Results go to the USB CDC console, where the
  * Zephyr shell (`can ...` commands) stays available afterwards.
@@ -189,7 +189,13 @@ int main(void)
 		return 0;
 	}
 
-	ret = can_set_mode(can_dev, CAN_MODE_LOOPBACK | CAN_MODE_FD);
+	/*
+	 * Loopback plus listen-only is the MCAN's internal loopback: frames are
+	 * received by the controller itself but not driven onto the pins.  Plain
+	 * loopback does drive the bus, and a 64-byte FD frame at the data rate on
+	 * a bus with classic-CAN motors gets error-flagged into bus-off.
+	 */
+	ret = can_set_mode(can_dev, CAN_MODE_LOOPBACK | CAN_MODE_LISTENONLY | CAN_MODE_FD);
 	if (ret != 0) {
 		LOG_ERR("can_set_mode: %d", ret);
 		return 0;
