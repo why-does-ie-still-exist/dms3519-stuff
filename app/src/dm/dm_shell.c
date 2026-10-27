@@ -27,6 +27,7 @@ enum stream_kind { STREAM_VEL, STREAM_TORQUE, STREAM_SAFEVEL };
 #define DM_FB_STALE_MS 100
 
 #define DM_SLOTS 8
+#define VEL_WIN_MAX 32
 
 struct dm_slot {
 	struct dm_motor m;
@@ -35,6 +36,8 @@ struct dm_slot {
 
 	struct k_work_delayable stream_work;
 	uint32_t stream_period_ms;
+	k_ticks_t stream_next;         /* absolute tick of the next run, so the period does not drift */
+	int64_t stream_t0_us;          /* start of the stream, for the trace clock */
 	enum stream_kind stream_kind;
 	uint32_t stream_count;
 	uint8_t last_state;
@@ -62,6 +65,21 @@ struct dm_slot {
 	 */
 	bool svel_idle;
 	bool svel_deadband_user;       /* set once 'dm veldeadband' is used */
+	/*
+	 * Velocity used by the safevel loop.  The driver's own estimate jitters
+	 * by +-0.15 rad/s at 1 kHz whatever VMAX is, so by default the loop
+	 * differences the rotor position over vel_win ticks and divides by the
+	 * gear ratio instead ('dm velsrc').
+	 */
+	bool vel_from_pos;
+	uint8_t vel_win_ms;            /* difference window in ms (time-based, not ticks) */
+	float pos_hist[32];            /* unwrapped rotor position per tick */
+	uint32_t cyc_hist[32];         /* and when that sample was taken */
+	uint8_t hist_idx;
+	uint8_t hist_fill;
+	float vel_est;                 /* output rad/s from the position difference */
+	bool vel_valid;                /* false until the window holds two fresh feedback frames */
+	bool svel_runaway;             /* independent guard tripped; cleared by a mode command */
 
 	/*
 	 * Host heartbeat watchdog: if armed, 'dm hb' must arrive at least every
@@ -82,6 +100,7 @@ static const struct device *const can_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_canbu
 
 static void stream_fn(struct k_work *work);
 static const char *kind_name(enum stream_kind k);
+static uint32_t argu(const char *s);
 
 static void slot_defaults(struct dm_slot *s)
 {
@@ -90,15 +109,76 @@ static void slot_defaults(struct dm_slot *s)
 	s->vel_ramp = 2.0f;
 	s->tor_ramp = 1.0f;
 	s->speed_cap = 20.0f;
+	/* Friction numbers measured on an unloaded DM-S3519-1EC at the output
+	 * shaft (tools/vel_step.py): 0.34 N.m to break away, 0.14 N.m to keep
+	 * turning at 0.5 rad/s.  The feed-forward sits just under kinetic so
+	 * the integrator always works upward from a small positive residual.
+	 */
 	s->vel_pi = (struct dm_vel_pi){
 		.kp = 0.30f,
-		.ki = 1.00f,
-		.tor_max = 2.00f,
-		.deadband = DM_VEL_DEADBAND(DM_S3519_VMAX),
+		.ki = 2.00f,
+		.tor_max = 0.50f, /* plenty for an unloaded shaft (0.34 N.m breakaway); raise under load */
+		.deadband = 0.01f,
+		.ff = 0.14f,
+		.ff_taper = 0.20f,
+		.i_max = 0.15f,
+		.ff_brk = 0.34f,
+		.stick_ms = 20.0f,
+		.stick_v = 0.05f,
+		.tau_ms = 3.0f,
 	};
 	s->svel_idle = true;
 	s->last_state = 0xFF;
+	s->vel_from_pos = true;
+	s->vel_win_ms = 10;
 	k_work_init_delayable(&s->stream_work, stream_fn);
+}
+
+/*
+ * Output-shaft velocity from the rotor position history.  Called once per
+ * tick before the loop runs.  The window is a TIME (vel_win_ms), found by
+ * walking back through the per-tick history using the feedback's own
+ * timestamps, so it means the same thing at any loop rate and jitter in when
+ * replies arrive does not alias into the estimate.  Sets vel_valid; while
+ * false the loop must not trust the estimate (it runs open, 0 N.m).
+ */
+static float vel_from_position(struct dm_slot *s)
+{
+	struct dm_feedback *fb = &s->m.fb;
+	uint32_t now = k_cycle_get_32();
+	uint32_t hz = sys_clock_hw_cycles_per_sec();
+	uint32_t win = (uint32_t)((uint64_t)s->vel_win_ms * hz / 1000U);
+
+	s->pos_hist[s->hist_idx] = fb->pos_unw;
+	s->cyc_hist[s->hist_idx] = fb->stamp_cyc;
+	uint8_t newest = s->hist_idx;
+
+	s->hist_idx = (s->hist_idx + 1) % VEL_WIN_MAX;
+	if (s->hist_fill < VEL_WIN_MAX) {
+		s->hist_fill++;
+	}
+	s->vel_valid = false;
+	/* The newest feedback must itself be recent (within two windows). */
+	if (!fb->valid || (uint32_t)(now - fb->stamp_cyc) > 2U * win) {
+		return 0.0f;
+	}
+	/* Walk back to the first sample at least one window older. */
+	for (uint8_t k = 1; k < s->hist_fill; k++) {
+		uint8_t idx = (newest + VEL_WIN_MAX - k) % VEL_WIN_MAX;
+		uint32_t dcyc = s->cyc_hist[newest] - s->cyc_hist[idx];
+
+		if (dcyc >= win) {
+			if (dcyc > 4U * win) {
+				return 0.0f; /* gap in feedback: no trustworthy estimate */
+			}
+			float dt = (float)dcyc / (float)hz;
+			float gr = s->m.gr > 0.0f ? s->m.gr : 1.0f;
+
+			s->vel_valid = true;
+			return (s->pos_hist[newest] - s->pos_hist[idx]) / dt / gr;
+		}
+	}
+	return 0.0f;
 }
 
 static inline bool have_motor(void)
@@ -130,9 +210,39 @@ static void stream_start(struct dm_slot *s, uint32_t period_ms)
 {
 	s->stream_period_ms = period_ms;
 	if (period_ms) {
+		s->stream_next = k_uptime_ticks();
+		s->stream_t0_us = k_ticks_to_us_floor64(s->stream_next);
 		k_work_schedule(&s->stream_work, K_NO_WAIT);
 	} else {
 		k_work_cancel_delayable(&s->stream_work);
+	}
+}
+
+/* Period in ms from a Hz argument; 1 kHz is the fastest the ms clock allows. */
+static uint32_t hz_to_period(uint32_t hz)
+{
+	if (hz == 0) {
+		return 0;
+	}
+	if (hz > 1000) {
+		hz = 1000;
+	}
+	return 1000 / hz;
+}
+
+#define DM_DEFAULT_HZ 1000
+
+/* Mode commands take "save" and/or a rate in Hz, in either order. */
+static void parse_mode_args(size_t argc, char **argv, bool *save, uint32_t *hz)
+{
+	*save = false;
+	*hz = DM_DEFAULT_HZ;
+	for (size_t i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "save")) {
+			*save = true;
+		} else {
+			*hz = argu(argv[i]);
+		}
 	}
 }
 
@@ -168,6 +278,70 @@ static void hb_trip(struct dm_slot *s)
 	       s->m.esc_id);
 }
 
+/* --- loop trace -----------------------------------------------------------
+ * A RAM capture of one slot's loop at full rate: commanded (ramped) velocity,
+ * measured velocity, torque sent and integrator state, per tick.  Armed with
+ * 'dm trace <n>', it starts on the first tick where the loop is actually
+ * working (safevel not idle, or any tick for other kinds) and stops after n
+ * samples; 'dm trace dump' prints CSV.  Capturing to RAM keeps the loop timing
+ * independent of the console.
+ */
+#define TRACE_MAX 2000
+
+struct trace_sample {
+	uint32_t t_us;
+	float cmd;
+	float meas;   /* velocity the loop used */
+	float fbv;    /* the driver's own velocity estimate */
+	float pos;    /* unwrapped rotor position, rad */
+	uint32_t fb_cyc; /* cycle stamp of the feedback used (shows its update rate) */
+	float tor;
+	float integ;
+	uint8_t state;
+};
+
+/*
+ * In its own section at the end of .noinit (app/linker/dm_trace.ld): the CAN
+ * message RAM must stay in the first 64 KiB of SRAM, and a 60 KiB buffer
+ * linked ahead of it pushes it out and silently kills CAN.
+ */
+static struct trace_sample trace_buf[TRACE_MAX] Z_GENERIC_SECTION(.dm_trace);
+static struct dm_slot *trace_slot;
+static volatile uint32_t trace_n;      /* samples captured */
+static volatile uint32_t trace_want;   /* 0 = not armed */
+static volatile bool trace_running;
+
+static void trace_tick(struct dm_slot *s)
+{
+	if (trace_want == 0 || s != trace_slot) {
+		return;
+	}
+	if (!trace_running) {
+		if (s->stream_kind == STREAM_SAFEVEL && s->svel_idle) {
+			return; /* wait for the move to start */
+		}
+		trace_running = true;
+		trace_n = 0;
+	}
+	if (trace_n >= trace_want) {
+		trace_want = 0;
+		trace_running = false;
+		return;
+	}
+	struct trace_sample *t = &trace_buf[trace_n];
+
+	t->t_us = (uint32_t)(k_ticks_to_us_floor64(k_uptime_ticks()) - s->stream_t0_us);
+	t->cmd = s->stream_kind == STREAM_TORQUE ? s->tor_setpoint : s->vel_current;
+	t->meas = (s->stream_kind == STREAM_SAFEVEL && s->vel_from_pos) ? s->vel_est : s->m.fb.vel;
+	t->fbv = s->m.fb.vel;
+	t->pos = s->m.fb.pos_unw;
+	t->fb_cyc = s->m.fb.stamp_cyc;
+	t->tor = s->stream_kind == STREAM_VEL ? 0.0f : s->tor_current;
+	t->integ = s->vel_pi.integ;
+	t->state = (s->m.fb.valid ? s->m.fb.state : 0x7F) | (s->vel_pi.kicking ? 0x80 : 0);
+	trace_n++;
+}
+
 static void stream_fn(struct k_work *work)
 {
 	struct k_work_delayable *dw = k_work_delayable_from_work(work);
@@ -181,6 +355,7 @@ static void stream_fn(struct k_work *work)
 		hb_trip(s);
 		return;
 	}
+	s->vel_est = vel_from_position(s);
 	if (s->vel_ramp > 0.0f) {
 		float step = s->vel_ramp * (float)s->stream_period_ms / 1000.0f;
 
@@ -232,7 +407,25 @@ static void stream_fn(struct k_work *work)
 		 * torque it asks for can be clamped.  vel_current is the ramped
 		 * setpoint computed above.
 		 */
-		bool fresh = m->fb.valid && (k_uptime_get() - m->fb.stamp) < DM_FB_STALE_MS;
+		bool fresh = m->fb.valid && (k_uptime_get() - m->fb.stamp) < DM_FB_STALE_MS &&
+			     (!s->vel_from_pos || s->vel_valid);
+		float meas = s->vel_from_pos ? s->vel_est : m->fb.vel;
+		/*
+		 * Independent runaway guard on the DRIVER's velocity, which does
+		 * not depend on our estimator: well above the setpoint means the
+		 * loop has lost the plot, so idle at 0 N.m and say so.
+		 */
+		float sp = s->vel_setpoint < 0.0f ? -s->vel_setpoint : s->vel_setpoint;
+		float drv = m->fb.vel < 0.0f ? -m->fb.vel : m->fb.vel;
+
+		if (!s->svel_idle && m->fb.valid && drv > 1.5f * sp + 1.0f) {
+			s->svel_idle = true;
+			s->svel_runaway = true;
+			s->vel_setpoint = 0.0f;
+			s->vel_current = 0.0f;
+			printk("dm: 0x%03x RUNAWAY: driver reports %.2f rad/s for a %.2f setpoint; "
+			       "safevel idled at 0 N.m\n", m->esc_id, (double)m->fb.vel, (double)sp);
+		}
 
 		if (s->svel_idle) {
 			/* Stopped: keep the frames flowing so the driver does
@@ -241,7 +434,7 @@ static void stream_fn(struct k_work *work)
 			dm_vel_pi_reset(&s->vel_pi);
 			s->tor_current = 0.0f;
 		} else if (fresh) {
-			s->tor_current = dm_vel_pi_step(&s->vel_pi, s->vel_current, m->fb.vel,
+			s->tor_current = dm_vel_pi_step(&s->vel_pi, s->vel_current, meas,
 							(float)s->stream_period_ms / 1000.0f);
 			s->svel_stale_warned = false;
 		} else {
@@ -267,7 +460,10 @@ static void stream_fn(struct k_work *work)
 			       s->last_state, (double)s->vel_current);
 		}
 	}
-	k_work_schedule(&s->stream_work, K_MSEC(s->stream_period_ms));
+	trace_tick(s);
+
+	s->stream_next += k_ms_to_ticks_ceil32(s->stream_period_ms);
+	k_work_schedule(&s->stream_work, K_TIMEOUT_ABS_TICKS(s->stream_next));
 }
 
 
@@ -488,6 +684,11 @@ static int enable_repeat(const struct dm_motor *m, uint16_t mode)
 {
 	int ret = 0;
 
+	/* A latched fault (comm-lost after the TIMEOUT register fired, over-
+	 * voltage, ...) makes the driver ignore enable; clear it first.
+	 */
+	(void)dm_motor_clear_error(m, mode);
+	k_sleep(K_MSEC(5));
 	for (int i = 0; i < 3; i++) {
 		int64_t before = m->fb.stamp;
 
@@ -644,8 +845,8 @@ static int cmd_stream(const struct shell *sh, size_t argc, char **argv)
 	if (argc > 2) {
 		cur->vel_ramp = argf(argv[2]);
 	}
-	stream_start(cur, hz ? 1000 / hz : 0);
-	shell_print(sh, "streaming %s", hz ? "on" : "off");
+	stream_start(cur, hz_to_period(hz));
+	shell_print(sh, "streaming %s%s", hz ? "on" : "off", hz > 1000 ? " (capped at 1000 Hz)" : "");
 	return 0;
 }
 
@@ -656,9 +857,11 @@ static int cmd_stream(const struct shell *sh, size_t argc, char **argv)
  */
 static int cmd_velmode(const struct shell *sh, size_t argc, char **argv)
 {
-	bool save = argc > 1 && !strcmp(argv[1], "save");
-	uint32_t hz = argc > 2 ? argu(argv[2]) : 100;
+	bool save;
+	uint32_t hz;
 	int ret;
+
+	parse_mode_args(argc, argv, &save, &hz);
 
 	if (need_motor(sh)) {
 		return -ENODEV;
@@ -690,9 +893,13 @@ static int cmd_velmode(const struct shell *sh, size_t argc, char **argv)
 	}
 	cur->stream_kind = STREAM_VEL;
 	hb_rearm(cur);
-	stream_start(cur, hz ? 1000 / hz : 0);
+	stream_start(cur, hz_to_period(hz));
+	if (cur->m.fb.valid && cur->m.fb.state != DM_STATE_ENABLED) {
+		shell_warn(sh, "driver reports state 0x%x, not enabled (0xD = comm lost; 'dm clearerr' "
+			   "then re-run, or check power)", cur->m.fb.state);
+	}
 	shell_print(sh, "velocity mode: enabled on ID 0x%03x, streaming at %u Hz; use 'dm vel <rad/s>'",
-		    DM_ID_VEL + cur->m.esc_id, hz);
+		    DM_ID_VEL + cur->m.esc_id, 1000U / cur->stream_period_ms);
 	return 0;
 }
 
@@ -702,9 +909,11 @@ static int cmd_velmode(const struct shell *sh, size_t argc, char **argv)
  */
 static int cmd_torquemode(const struct shell *sh, size_t argc, char **argv)
 {
-	bool save = argc > 1 && !strcmp(argv[1], "save");
-	uint32_t hz = argc > 2 ? argu(argv[2]) : 100;
+	bool save;
+	uint32_t hz;
 	int ret;
+
+	parse_mode_args(argc, argv, &save, &hz);
 
 	if (need_motor(sh)) {
 		return -ENODEV;
@@ -737,10 +946,15 @@ static int cmd_torquemode(const struct shell *sh, size_t argc, char **argv)
 	}
 	cur->stream_kind = STREAM_TORQUE;
 	hb_rearm(cur);
-	stream_start(cur, hz ? 1000 / hz : 0);
+	stream_start(cur, hz_to_period(hz));
+	if (cur->m.fb.valid && cur->m.fb.state != DM_STATE_ENABLED) {
+		shell_warn(sh, "driver reports state 0x%x, not enabled (0xD = comm lost; 'dm clearerr' "
+			   "then re-run, or check power)", cur->m.fb.state);
+	}
 	shell_print(sh, "torque mode: MIT on ID 0x%03x, Kp=Kd=0, streaming at %u Hz, ramp %.1f N.m/s, "
 		    "speed cap %.1f rad/s; use 'dm torque <Nm>' or 'dm current <A>'",
-		    DM_ID_MIT + cur->m.esc_id, hz, (double)cur->tor_ramp, (double)cur->speed_cap);
+		    DM_ID_MIT + cur->m.esc_id, 1000U / cur->stream_period_ms, (double)cur->tor_ramp,
+		    (double)cur->speed_cap);
 	return 0;
 }
 
@@ -759,9 +973,19 @@ static int cmd_torquemode(const struct shell *sh, size_t argc, char **argv)
  */
 static int cmd_safevelmode(const struct shell *sh, size_t argc, char **argv)
 {
-	bool save = argc > 1 && !strcmp(argv[1], "save");
-	uint32_t hz = argc > 2 ? argu(argv[2]) : 100;
+	bool save;
+	uint32_t hz;
 	int ret;
+
+	parse_mode_args(argc, argv, &save, &hz);
+	if (hz < 200) {
+		shell_error(sh, "safevel needs at least 200 Hz (velocity is differenced over %u ms of "
+			    "feedback)", cur ? cur->vel_win_ms : 10);
+		return -EINVAL;
+	}
+	if (cur != NULL) {
+		cur->svel_runaway = false;
+	}
 
 	if (need_motor(sh)) {
 		return -ENODEV;
@@ -805,17 +1029,27 @@ static int cmd_safevelmode(const struct shell *sh, size_t argc, char **argv)
 	 * Size the deadband to the resolution the driver actually reports:
 	 * VMAX may differ from the default, and it sets the quantisation step.
 	 */
-	if (!cur->svel_deadband_user) {
+	if (!cur->svel_deadband_user && !cur->vel_from_pos) {
 		cur->vel_pi.deadband = DM_VEL_DEADBAND(cur->m.v_max);
 	}
 	cur->stream_kind = STREAM_SAFEVEL;
 	hb_rearm(cur);
-	stream_start(cur, hz ? 1000 / hz : 0);
+	stream_start(cur, hz_to_period(hz));
+	if (cur->m.fb.valid && cur->m.fb.state != DM_STATE_ENABLED) {
+		shell_warn(sh, "driver reports state 0x%x, not enabled (0xD = comm lost; 'dm clearerr' "
+			   "then re-run, or check power)", cur->m.fb.state);
+	}
 	shell_print(sh, "safe velocity mode: MIT on ID 0x%03x, streaming at %u Hz, ramp %.1f rad/s^2",
-		    DM_ID_MIT + cur->m.esc_id, hz, (double)cur->vel_ramp);
-	shell_print(sh, "torque cap %.2f N.m (~%.2f A), gains kp %.3f ki %.3f, deadband %.3f rad/s",
-		    (double)cur->vel_pi.tor_max, (double)(cur->vel_pi.tor_max / kt_nm_per_a),
-		    (double)cur->vel_pi.kp, (double)cur->vel_pi.ki, (double)cur->vel_pi.deadband);
+		    DM_ID_MIT + cur->m.esc_id, 1000U / cur->stream_period_ms, (double)cur->vel_ramp);
+	shell_print(sh, "torque cap %.2f N.m (~%.2f A), gains kp %.3f ki %.3f (imax %.2f), "
+		    "deadband %.3f rad/s", (double)cur->vel_pi.tor_max,
+		    (double)(cur->vel_pi.tor_max / kt_nm_per_a), (double)cur->vel_pi.kp,
+		    (double)cur->vel_pi.ki, (double)cur->vel_pi.i_max, (double)cur->vel_pi.deadband);
+	shell_print(sh, "friction ff %.3f N.m, breakaway kick %.3f N.m after %.0f ms stuck, "
+		    "velocity filter %.1f ms, velocity from %s", (double)cur->vel_pi.ff,
+		    (double)cur->vel_pi.ff_brk, (double)cur->vel_pi.stick_ms,
+		    (double)cur->vel_pi.tau_ms,
+		    cur->vel_from_pos ? "rotor position" : "driver estimate");
 	shell_print(sh, "stalling is held at the cap, not tripped; speed returns when the load clears");
 	shell_print(sh, "idle until 'dm vel <rad/s>'; 'dm stop' returns to idle (0 N.m)");
 	return 0;
@@ -861,6 +1095,128 @@ static int cmd_velgains(const struct shell *sh, size_t argc, char **argv)
 	}
 	shell_print(sh, "safevel gains: kp %.4f N.m per rad/s, ki %.4f N.m per rad",
 		    (double)cur->vel_pi.kp, (double)cur->vel_pi.ki);
+	return 0;
+}
+
+static int cmd_velff(const struct shell *sh, size_t argc, char **argv)
+{
+	if (need_motor(sh)) {
+		return -ENODEV;
+	}
+	if (argc > 1) {
+		cur->vel_pi.ff = argf(argv[1]) < 0.0f ? 0.0f : argf(argv[1]);
+	}
+	if (argc > 2) {
+		cur->vel_pi.ff_brk = argf(argv[2]) < 0.0f ? 0.0f : argf(argv[2]);
+	}
+	if (argc > 3) {
+		cur->vel_pi.i_max = argf(argv[3]) < 0.0f ? 0.0f : argf(argv[3]);
+	}
+	if (argc > 1) {
+		dm_vel_pi_reset(&cur->vel_pi);
+	}
+	shell_print(sh, "safevel feed-forward: kinetic %.3f N.m, breakaway kick %.3f N.m, "
+		    "integrator clamp %.2f N.m (0 = torque cap)", (double)cur->vel_pi.ff,
+		    (double)cur->vel_pi.ff_brk, (double)cur->vel_pi.i_max);
+	return 0;
+}
+
+static int cmd_velfilt(const struct shell *sh, size_t argc, char **argv)
+{
+	if (need_motor(sh)) {
+		return -ENODEV;
+	}
+	if (argc > 1) {
+		cur->vel_pi.tau_ms = argf(argv[1]) < 0.0f ? 0.0f : argf(argv[1]);
+	}
+	if (argc > 2) {
+		cur->vel_pi.stick_ms = argf(argv[2]) < 0.0f ? 0.0f : argf(argv[2]);
+	}
+	if (argc > 3) {
+		cur->vel_pi.ff_taper = argf(argv[3]) < 0.0f ? 0.0f : argf(argv[3]);
+	}
+	if (argc > 4) {
+		cur->vel_pi.stick_v = argf(argv[4]) < 0.0f ? 0.0f : argf(argv[4]);
+	}
+	if (argc > 1) {
+		dm_vel_pi_reset(&cur->vel_pi);
+	}
+	shell_print(sh, "safevel filter: velocity low-pass %.1f ms, kick after %.0f ms under %.3f rad/s, "
+		    "feed-forward tapered over %.2f rad/s", (double)cur->vel_pi.tau_ms,
+		    (double)cur->vel_pi.stick_ms, (double)cur->vel_pi.stick_v,
+		    (double)cur->vel_pi.ff_taper);
+	return 0;
+}
+
+static int cmd_velsrc(const struct shell *sh, size_t argc, char **argv)
+{
+	if (need_motor(sh)) {
+		return -ENODEV;
+	}
+	if (argc > 1) {
+		if (!strcmp(argv[1], "pos")) {
+			cur->vel_from_pos = true;
+		} else if (!strcmp(argv[1], "fb")) {
+			cur->vel_from_pos = false;
+		} else {
+			shell_error(sh, "usage: dm velsrc pos|fb [window ticks]");
+			return -EINVAL;
+		}
+	}
+	if (argc > 2) {
+		uint32_t w = argu(argv[2]);
+
+		cur->vel_win_ms = w < 2 ? 2 : (w > 30 ? 30 : w);
+	}
+	shell_print(sh, "safevel velocity source: %s (gear ratio %.3f); now %.4f rad/s%s vs driver %.4f",
+		    cur->vel_from_pos ? "rotor position differenced over time" : "driver estimate",
+		    (double)cur->m.gr, (double)cur->vel_est, cur->vel_valid ? "" : " (invalid)",
+		    (double)cur->m.fb.vel);
+	if (cur->vel_from_pos) {
+		shell_print(sh, "window %u ms (needs feedback at least every %u ms)", cur->vel_win_ms,
+			    cur->vel_win_ms);
+	}
+	return 0;
+}
+
+static int cmd_trace(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc > 1 && !strcmp(argv[1], "dump")) {
+		uint32_t n = trace_running ? 0 : trace_n;
+
+		shell_print(sh, "trace: %u samples%s", n, trace_want ? " (still armed)" : "");
+		shell_print(sh, "t_us,cmd,meas,fbv,tor,integ,state,pos,fb_cyc");
+		for (uint32_t i = 0; i < n; i++) {
+			const struct trace_sample *t = &trace_buf[i];
+
+			shell_print(sh, "%u,%.4f,%.4f,%.4f,%.4f,%.4f,%u,%.5f,%u", t->t_us, (double)t->cmd,
+				    (double)t->meas, (double)t->fbv, (double)t->tor, (double)t->integ,
+				    t->state, (double)t->pos, t->fb_cyc);
+		}
+		shell_print(sh, "trace: end");
+		return 0;
+	}
+	if (argc > 1) {
+		uint32_t n = argu(argv[1]);
+
+		if (need_motor(sh)) {
+			return -ENODEV;
+		}
+		if (n == 0 || n > TRACE_MAX) {
+			shell_error(sh, "1..%d samples", TRACE_MAX);
+			return -EINVAL;
+		}
+		trace_running = false;
+		trace_n = 0;
+		trace_slot = cur;
+		trace_want = n;
+		shell_print(sh, "trace armed on esc 0x%03x: %u samples at the loop rate, starts with "
+			    "the next move ('dm vel'); 'dm trace dump' to read",
+			    cur->m.esc_id, n);
+		return 0;
+	}
+	shell_print(sh, "trace: %s, %u/%u samples%s", trace_want ? "armed" : "idle", trace_n,
+		    trace_want ? trace_want : trace_n, trace_running ? " (capturing)" : "");
 	return 0;
 }
 
@@ -1034,7 +1390,7 @@ static int cmd_status(const struct shell *sh, size_t argc, char **argv)
 
 		shell_print(sh, "stream %s %u ms (safevel%s), sent %u, setpoint %.3f, sending %.3f rad/s",
 			    cur->stream_period_ms ? "on" : "off", cur->stream_period_ms,
-			    cur->svel_idle ? ", IDLE" : "", cur->stream_count,
+			    cur->svel_runaway ? ", RUNAWAY GUARD TRIPPED" : (cur->svel_idle ? ", IDLE" : ""), cur->stream_count,
 			    (double)cur->vel_setpoint, (double)cur->vel_current);
 		shell_print(sh, "torque %.3f N.m (~%.2f A) of %.2f cap%s, integ %.3f, kp %.3f ki %.3f, "
 			    "deadband %.3f rad/s", (double)cur->tor_current,
@@ -1490,17 +1846,21 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD_ARG(pos, NULL, "<pos> <vel>: position-velocity frame", cmd_pos, 3, 0),
 	SHELL_CMD_ARG(vel, NULL, "<rad/s>: velocity setpoint (one frame, or continuous with stream)", cmd_vel, 2, 0),
 	SHELL_CMD(stop, NULL, "setpoint 0 (safevel: idle at 0 N.m until the next 'dm vel')", cmd_stop),
-	SHELL_CMD_ARG(torquemode, NULL, "[save] [hz]: MIT mode with Kp=Kd=0, stream the torque term", cmd_torquemode, 1, 2),
+	SHELL_CMD_ARG(torquemode, NULL, "[save] [hz=1000]: MIT mode with Kp=Kd=0, stream the torque term", cmd_torquemode, 1, 2),
 	SHELL_CMD_ARG(torque, NULL, "<N.m>: torque (current) setpoint at the output shaft", cmd_torque, 2, 0),
 	SHELL_CMD_ARG(current, NULL, "<A>: current setpoint, converted to torque with Kt", cmd_current, 2, 0),
 	SHELL_CMD_ARG(kt, NULL, "[N.m/A]: show/set the Kt used by 'dm current'", cmd_kt, 1, 1),
 	SHELL_CMD_ARG(torqueramp, NULL, "[N.m/s]: show/set the torque setpoint ramp (0 = step)", cmd_torqueramp, 1, 1),
 	SHELL_CMD_ARG(speedcap, NULL, "[rad/s]: runaway guard for torque mode (0 = off)", cmd_speedcap, 1, 1),
 	SHELL_CMD_ARG(stream, NULL, "[hz [ramp rad/s^2]]: stream the velocity setpoint (0 = off)", cmd_stream, 1, 2),
-	SHELL_CMD_ARG(velmode, NULL, "[save] [hz]: disable, CTRL_MODE=3, enable on 0x200+ID, stream", cmd_velmode, 1, 2),
-	SHELL_CMD_ARG(safevelmode, NULL, "[save] [hz]: velocity control with a saturating torque cap", cmd_safevelmode, 1, 2),
+	SHELL_CMD_ARG(velmode, NULL, "[save] [hz=1000]: disable, CTRL_MODE=3, enable on 0x200+ID, stream", cmd_velmode, 1, 2),
+	SHELL_CMD_ARG(safevelmode, NULL, "[save] [hz=1000]: velocity control with a saturating torque cap", cmd_safevelmode, 1, 2),
 	SHELL_CMD_ARG(torquecap, NULL, "[N.m]: show/set the safevel torque cap (saturates, no trip)", cmd_torquecap, 1, 1),
 	SHELL_CMD_ARG(velgains, NULL, "[kp] [ki]: show/set the safevel velocity-loop gains", cmd_velgains, 1, 2),
+	SHELL_CMD_ARG(velff, NULL, "[kinetic N.m] [breakaway N.m] [imax N.m]: safevel friction feed-forward, kick, integrator clamp", cmd_velff, 1, 3),
+	SHELL_CMD_ARG(velfilt, NULL, "[tau ms] [stick ms] [taper rad/s] [stick rad/s]: safevel velocity filter, kick delay, ff taper, stuck threshold", cmd_velfilt, 1, 4),
+	SHELL_CMD_ARG(velsrc, NULL, "[pos|fb] [window ms]: velocity the safevel loop uses (default: rotor position over 10 ms)", cmd_velsrc, 1, 2),
+	SHELL_CMD_ARG(trace, NULL, "<n> | dump: capture n loop ticks of the selected motor to RAM, or print them as CSV", cmd_trace, 1, 1),
 	SHELL_CMD_ARG(veldeadband, NULL, "[rad/s]: velocity error the safevel loop ignores (quantisation)", cmd_veldeadband, 1, 1),
 	SHELL_CMD_ARG(watchdog, NULL, "[ms]: disable the motor if no 'dm hb' arrives within ms (0 = off)", cmd_watchdog, 1, 1),
 	SHELL_CMD(hb, NULL, "host heartbeat for the watchdog", cmd_hb),

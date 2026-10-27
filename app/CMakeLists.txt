@@ -17,3 +17,6 @@ target_sources(app PRIVATE
   src/dm/dm_shell.c
 )
 target_include_directories(app PRIVATE src/dm)
+
+# Keeps big app buffers behind the CAN message RAM (see the file).
+zephyr_linker_sources(NOINIT linker/dm_trace.ld)
