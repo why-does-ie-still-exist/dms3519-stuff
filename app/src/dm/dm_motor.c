@@ -293,6 +293,22 @@ static void rx_3519(const struct device *dev, struct can_frame *frame, void *use
 	m->fb3519.stamp = k_uptime_get();
 }
 
+void dm_motor_release(struct dm_motor *m)
+{
+	if (m->can == NULL) {
+		return;
+	}
+	if (m->rx_filter_fb >= 0) {
+		can_remove_rx_filter(m->can, m->rx_filter_fb);
+	}
+	if (m->rx_filter_3519 >= 0) {
+		can_remove_rx_filter(m->can, m->rx_filter_3519);
+	}
+	m->rx_filter_fb = -1;
+	m->rx_filter_3519 = -1;
+	m->can = NULL;
+}
+
 int dm_motor_init(struct dm_motor *m, const struct device *can, uint16_t esc_id, uint16_t mst_id,
 		  float p_max, float v_max, float t_max)
 {
@@ -303,6 +319,8 @@ int dm_motor_init(struct dm_motor *m, const struct device *can, uint16_t esc_id,
 	int ret;
 
 	memset(m, 0, sizeof(*m));
+	m->rx_filter_fb = -1;
+	m->rx_filter_3519 = -1;
 	m->can = can;
 	m->esc_id = esc_id;
 	m->mst_id = mst_id;
@@ -315,6 +333,7 @@ int dm_motor_init(struct dm_motor *m, const struct device *can, uint16_t esc_id,
 	ret = can_add_rx_filter(can, rx_feedback, m, &filter);
 	if (ret < 0) {
 		LOG_ERR("feedback filter: %d", ret);
+		m->can = NULL;
 		return ret;
 	}
 	m->rx_filter_fb = ret;

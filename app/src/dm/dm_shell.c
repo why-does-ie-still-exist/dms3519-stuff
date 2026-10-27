@@ -218,7 +218,7 @@ static int cmd_fb(const struct shell *sh, size_t argc, char **argv);
 static int need_motor(const struct shell *sh)
 {
 	if (!motor_ready) {
-		shell_error(sh, "run: dm init <esc_id> <mst_id> [pmax vmax tmax]");
+		shell_error(sh, "run: dm init <esc_id> [mst_id] [pmax vmax tmax]");
 		return -ENODEV;
 	}
 	return 0;
@@ -237,11 +237,19 @@ static uint32_t argu(const char *s)
 static int cmd_init(const struct shell *sh, size_t argc, char **argv)
 {
 	uint16_t esc = argc > 1 ? argu(argv[1]) : 0x01;
-	uint16_t mst = argc > 2 ? argu(argv[2]) : 0x00;
+	/* MST_ID defaults to ESC_ID + 0x10, the DaMiao convention set_can_id.py uses. */
+	uint16_t mst = argc > 2 ? argu(argv[2]) : esc + 0x10;
 	float pmax = argc > 3 ? argf(argv[3]) : DM_S3519_PMAX;
 	float vmax = argc > 4 ? argf(argv[4]) : DM_S3519_VMAX;
 	float tmax = argc > 5 ? argf(argv[5]) : DM_S3519_TMAX;
-	int ret = dm_motor_init(&motor, can_dev, esc, mst, pmax, vmax, tmax);
+	int ret;
+
+	/* Re-init is common (bus scans, ID changes): drop the old RX filters first,
+	 * the MCAN only has a few dozen of them.
+	 */
+	motor_ready = false;
+	dm_motor_release(&motor);
+	ret = dm_motor_init(&motor, can_dev, esc, mst, pmax, vmax, tmax);
 
 	if (ret) {
 		shell_error(sh, "init failed: %d", ret);
@@ -1054,9 +1062,193 @@ static int cmd_info(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+
+/* --- bus scan ------------------------------------------------------------
+ * There is no broadcast on the DaMiao register channel: a 0x7FF read is only
+ * answered by the motor whose ESC_ID is in the payload, and the answer comes
+ * back on that motor's MST_ID, which we do not know either.  So probe every
+ * ESC_ID with a read of RID 8 through a catch-all RX filter; each reply gives
+ * ESC_ID (payload bytes 0-1) and MST_ID (the reply's CAN ID).  This is what
+ * the DaMiao debug tool and the open-source scanners do too.
+ *
+ * Two motors with identical ESC_ID *and* MST_ID answer with identical frames
+ * at the same time, which CAN merges into one; the host tool catches that case
+ * afterwards by reading the serial number, which differs.
+ */
+#define SCAN_MAX 16
+
+struct scan_hit {
+	uint16_t esc;
+	uint16_t mst;
+	uint32_t count;
+};
+
+static struct scan_hit scan_hits[SCAN_MAX];
+static volatile int scan_nhits;
+static volatile bool scan_overflow;
+static volatile uint32_t scan_other_frames;
+static volatile uint16_t scan_other_id;
+static K_SEM_DEFINE(scan_tx_sem, 0, 1);
+static volatile int scan_tx_err;
+
+static void scan_tx_done(const struct device *dev, int error, void *user_data)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(user_data);
+	scan_tx_err = error;
+	k_sem_give(&scan_tx_sem);
+}
+
+static void scan_rx(const struct device *dev, struct can_frame *frame, void *user_data)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(user_data);
+	if (frame->flags & (CAN_FRAME_IDE | CAN_FRAME_RTR)) {
+		return;
+	}
+	if (can_dlc_to_bytes(frame->dlc) >= 8 && frame->data[2] == 0x33 &&
+	    frame->data[3] == DM_RID_ESC_ID) {
+		uint16_t esc = frame->data[0] | ((frame->data[1] & 0x07) << 8);
+		uint16_t mst = frame->id;
+
+		for (int i = 0; i < scan_nhits; i++) {
+			if (scan_hits[i].esc == esc && scan_hits[i].mst == mst) {
+				scan_hits[i].count++;
+				return;
+			}
+		}
+		if (scan_nhits < SCAN_MAX) {
+			scan_hits[scan_nhits].esc = esc;
+			scan_hits[scan_nhits].mst = mst;
+			scan_hits[scan_nhits].count = 1;
+			scan_nhits++;
+		} else {
+			scan_overflow = true;
+		}
+		return;
+	}
+	scan_other_frames++;
+	scan_other_id = frame->id;
+}
+
+static int cmd_scan(const struct shell *sh, size_t argc, char **argv)
+{
+	uint32_t first = argc > 1 ? argu(argv[1]) : 0x000;
+	uint32_t last = argc > 2 ? argu(argv[2]) : 0x7FE;
+	uint32_t gap_us = argc > 3 ? argu(argv[3]) : 1000;
+	struct can_filter all = {.id = 0, .mask = 0, .flags = 0};
+	struct can_bus_err_cnt e0, e1;
+	enum can_state s0, s1;
+	int filter, tx_fail = 0, consecutive = 0;
+	bool aborted = false;
+
+	if (last > 0x7FE || first > last) {
+		shell_error(sh, "usage: dm scan [first last] [gap_us]   (ids 0x000..0x7FE)");
+		return -EINVAL;
+	}
+	if (stream_period_ms) {
+		shell_error(sh, "scan: stop the streamer first (dm stream 0)");
+		return -EBUSY;
+	}
+	/*
+	 * The MCAN acts on the first filter element that matches, so a reply on
+	 * the initialised motor's MST_ID would go to its filter and never reach
+	 * the catch-all.  Drop the motor's filters for the scan, reinstall after.
+	 */
+	bool had_motor = motor_ready;
+	uint16_t esc = motor.esc_id, mst = motor.mst_id;
+	float pmax = motor.p_max, vmax = motor.v_max, tmax = motor.t_max;
+	bool fd = motor.fd;
+
+	if (had_motor) {
+		motor_ready = false;
+		dm_motor_release(&motor);
+	}
+	scan_nhits = 0;
+	scan_overflow = false;
+	scan_other_frames = 0;
+	filter = can_add_rx_filter(can_dev, scan_rx, NULL, &all);
+	if (filter < 0) {
+		shell_error(sh, "scan: catch-all filter failed: %d", filter);
+		if (had_motor) {
+			motor_ready = dm_motor_init(&motor, can_dev, esc, mst, pmax, vmax, tmax) == 0;
+			motor.fd = fd;
+		}
+		return filter;
+	}
+	can_get_state(can_dev, &s0, &e0);
+	for (uint32_t id = first; id <= last; id++) {
+		struct can_frame f = {
+			.id = DM_ID_REG,
+			.dlc = 4,
+			.flags = fd ? (CAN_FRAME_FDF | CAN_FRAME_BRS) : 0,
+			.data = {id & 0xFF, (id >> 8) & 0x07, 0x33, DM_RID_ESC_ID},
+		};
+		/*
+		 * A blocking can_send() never returns while nothing on the bus
+		 * acknowledges (the timeout only covers getting a mailbox), which
+		 * would wedge the shell thread.  Use the completion callback and
+		 * give up after a while instead.
+		 */
+		k_sem_reset(&scan_tx_sem);
+		int ret = can_send(can_dev, &f, K_MSEC(20), scan_tx_done, NULL);
+
+		if (ret == 0) {
+			ret = k_sem_take(&scan_tx_sem, K_MSEC(100)) ? -ETIMEDOUT : scan_tx_err;
+		}
+		if (ret) {
+			tx_fail++;
+			if (ret == -ETIMEDOUT || ++consecutive >= 8) {
+				shell_error(sh, "scan: aborted at esc 0x%03x, bus not acknowledging (%d): "
+					    "no powered node, wrong bitrate, or wiring", id, ret);
+				/* Flush the frame still retrying in the TX FIFO. */
+				(void)dm_bus_configure(can_dev, false, fd);
+				aborted = true;
+				break;
+			}
+		} else {
+			consecutive = 0;
+		}
+		k_usleep(gap_us);
+	}
+	k_sleep(K_MSEC(50));
+	can_remove_rx_filter(can_dev, filter);
+	can_get_state(can_dev, &s1, &e1);
+	if (had_motor) {
+		motor_ready = dm_motor_init(&motor, can_dev, esc, mst, pmax, vmax, tmax) == 0;
+		motor.fd = fd;
+	}
+
+	for (int i = 0; i < scan_nhits; i++) {
+		shell_print(sh, "scan: found esc 0x%03x mst 0x%03x (%u replies)", scan_hits[i].esc,
+			    scan_hits[i].mst, scan_hits[i].count);
+	}
+	if (scan_overflow) {
+		shell_print(sh, "scan: more than %d responders, list truncated", SCAN_MAX);
+	}
+	if (scan_other_frames) {
+		shell_print(sh, "scan: %u other frames seen (last id 0x%03x)", scan_other_frames,
+			    scan_other_id);
+	}
+	if (tx_fail) {
+		shell_print(sh, "scan: %d probe frames failed to send", tx_fail);
+	}
+	/* Counters falling or the state recovering (after an earlier empty-bus
+	 * scan) is good news; only a rise hints at two nodes talking at once.
+	 */
+	if (!aborted && (e1.tx_err_cnt > e0.tx_err_cnt || e1.rx_err_cnt > e0.rx_err_cnt ||
+			 s1 > s0)) {
+		shell_print(sh, "scan: bus errors rose (tx %u->%u, rx %u->%u, state %d->%d); "
+			    "duplicate IDs on the bus can cause this", e0.tx_err_cnt, e1.tx_err_cnt,
+			    e0.rx_err_cnt, e1.rx_err_cnt, s0, s1);
+	}
+	shell_print(sh, "scan: %d motor(s) answered in esc 0x%03x..0x%03x", scan_nhits, first, last);
+	return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(
 	dm_cmds,
-	SHELL_CMD_ARG(init, NULL, "<esc_id> <mst_id> [pmax vmax tmax]: set up a motor", cmd_init, 1, 5),
+	SHELL_CMD_ARG(init, NULL, "<esc_id> [mst_id = esc+0x10] [pmax vmax tmax]: set up a motor", cmd_init, 1, 5),
 	SHELL_CMD_ARG(mode, NULL, "[mit|pos|vel|psi]: frame-ID mode used by enable/disable/zero", cmd_mode, 1, 1),
 	SHELL_CMD(enable, NULL, "enable motor (FF..FC)", cmd_enable),
 	SHELL_CMD(disable, NULL, "disable motor (FF..FD)", cmd_disable),
@@ -1089,6 +1281,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD_ARG(write, NULL, "<rid> <value>: write register (RAM)", cmd_write, 3, 0),
 	SHELL_CMD(save, NULL, "save registers to flash (0x7FF/0xAA)", cmd_save),
 	SHELL_CMD(info, NULL, "read the common registers", cmd_info),
+	SHELL_CMD_ARG(scan, NULL, "[first last] [gap_us]: probe every ESC_ID, list motors (esc, mst)", cmd_scan, 1, 3),
 	SHELL_CMD_ARG(bus, NULL, "<normal|loopback> [fd]: set CAN controller mode (fd = send FD+BRS frames)", cmd_bus, 2, 1),
 	SHELL_SUBCMD_SET_END);
 

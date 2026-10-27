@@ -203,6 +203,9 @@ struct dm_motor {
 int dm_motor_init(struct dm_motor *m, const struct device *can, uint16_t esc_id, uint16_t mst_id,
 		  float p_max, float v_max, float t_max);
 
+/** Remove the RX filters installed by dm_motor_init(); safe on a zeroed object. */
+void dm_motor_release(struct dm_motor *m);
+
 /**
  * Read PMAX/VMAX/TMAX (RIDs 0x15-0x17) from the driver and adopt them for the
  * MIT/feedback mapping.  Returns 0 if all three were read, else the error.
