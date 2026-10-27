@@ -80,6 +80,7 @@ struct dm_slot {
 	float vel_est;                 /* output rad/s from the position difference */
 	bool vel_valid;                /* false until the window holds two fresh feedback frames */
 	bool svel_runaway;             /* independent guard tripped; cleared by a mode command */
+	bool energised;                /* we have enabled this driver and not disabled it since */
 
 	/*
 	 * Host heartbeat watchdog: if armed, 'dm hb' must arrive at least every
@@ -95,6 +96,13 @@ static struct dm_slot *cur;        /* slot the shell commands act on; NULL until
 static float kt_nm_per_a = 0.4537f; /* DaMiao selection table, output shaft; shared */
 /* One heartbeat clock for all slots: the host is either alive or not. */
 static uint32_t hb_last_ms;
+/*
+ * Single-motor lockout.  With several motors fed through one thin supply
+ * lead, only one may be energised at a time: a command that would enable or
+ * drive a motor is refused while another slot is energised or streaming.
+ * 'dm lockout off' lifts it once the wiring can take the current.
+ */
+static bool lockout = true;
 
 static const struct device *const can_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_canbus));
 
@@ -268,6 +276,7 @@ static void slot_halt(struct dm_slot *s)
 	dm_vel_pi_reset(&s->vel_pi);
 	(void)dm_motor_mit(&s->m, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
 	(void)dm_motor_disable(&s->m, s->cur_mode);
+	s->energised = false;
 }
 
 static void hb_trip(struct dm_slot *s)
@@ -478,6 +487,33 @@ static int need_motor(const struct shell *sh)
 	return 0;
 }
 
+/*
+ * Enforce the single-motor lockout for a command that would energise the
+ * selected motor.  Returns 0 if allowed; otherwise prints which motor is in
+ * the way and returns -EBUSY.
+ */
+static int lockout_check(const struct shell *sh)
+{
+	if (!lockout) {
+		return 0;
+	}
+	for (int i = 0; i < DM_SLOTS; i++) {
+		struct dm_slot *s = &slots[i];
+
+		if (s == cur || !s->ready) {
+			continue;
+		}
+		if (s->energised || s->stream_period_ms) {
+			shell_error(sh, "lockout: motor esc 0x%03x is %s; one motor at a time "
+				    "('dm init 0x%x', 'dm disable', 'dm stream 0' first, or 'dm lockout off')",
+				    s->m.esc_id, s->stream_period_ms ? "streaming" : "enabled",
+				    s->m.esc_id);
+			return -EBUSY;
+		}
+	}
+	return 0;
+}
+
 static float argf(const char *s)
 {
 	return strtof(s, NULL);
@@ -618,9 +654,10 @@ static int cmd_motors(const struct shell *sh, size_t argc, char **argv)
 				    s->m.fb.valid ? "ok" : "none", s->m.fb.state, (double)s->m.fb.vel,
 				    (double)s->m.fb.tor, s->hb_tripped ? " [WD TRIPPED]" : "");
 		} else {
-			shell_print(sh, "%c esc 0x%03x mst 0x%03x  stream off  fb %s state %u vel %.3f",
+			shell_print(sh, "%c esc 0x%03x mst 0x%03x  stream off%s  fb %s state %u vel %.3f",
 				    s == cur ? '*' : ' ', s->m.esc_id, s->m.mst_id,
-				    s->m.fb.valid ? "ok" : "none", s->m.fb.state, (double)s->m.fb.vel);
+				    s->energised ? ", ENABLED" : "", s->m.fb.valid ? "ok" : "none",
+				    s->m.fb.state, (double)s->m.fb.vel);
 		}
 	}
 	if (n == 0) {
@@ -704,7 +741,19 @@ static int enable_repeat(const struct dm_motor *m, uint16_t mode)
 	return ret;
 }
 
-SIMPLE_CMD(enable, enable_repeat)
+static int cmd_enable(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	if (need_motor(sh) || lockout_check(sh)) {
+		return -ENODEV;
+	}
+	int ret = enable_repeat(&cur->m, cur->cur_mode);
+
+	cur->energised = (ret == 0);
+	shell_print(sh, "enable: %d", ret);
+	return ret;
+}
 static int cmd_disable(const struct shell *sh, size_t argc, char **argv)
 {
 	ARG_UNUSED(argc);
@@ -714,6 +763,7 @@ static int cmd_disable(const struct shell *sh, size_t argc, char **argv)
 	}
 	int ret = dm_motor_disable(&cur->m, cur->cur_mode);
 
+	cur->energised = false;
 	shell_print(sh, "disable: %d", ret);
 	if (cur->stream_period_ms) {
 		shell_print(sh, "(its %s stream is still running; 'dm stream 0' stops it, or a mode "
@@ -726,7 +776,7 @@ SIMPLE_CMD(clearerr, dm_motor_clear_error)
 
 static int cmd_mit(const struct shell *sh, size_t argc, char **argv)
 {
-	if (need_motor(sh)) {
+	if (need_motor(sh) || lockout_check(sh)) {
 		return -ENODEV;
 	}
 	if (argc != 6) {
@@ -739,7 +789,7 @@ static int cmd_mit(const struct shell *sh, size_t argc, char **argv)
 
 static int cmd_pos(const struct shell *sh, size_t argc, char **argv)
 {
-	if (need_motor(sh)) {
+	if (need_motor(sh) || lockout_check(sh)) {
 		return -ENODEV;
 	}
 	if (argc != 3) {
@@ -751,7 +801,7 @@ static int cmd_pos(const struct shell *sh, size_t argc, char **argv)
 
 static int cmd_vel(const struct shell *sh, size_t argc, char **argv)
 {
-	if (need_motor(sh)) {
+	if (need_motor(sh) || lockout_check(sh)) {
 		return -ENODEV;
 	}
 	if (argc != 2) {
@@ -863,7 +913,7 @@ static int cmd_velmode(const struct shell *sh, size_t argc, char **argv)
 
 	parse_mode_args(argc, argv, &save, &hz);
 
-	if (need_motor(sh)) {
+	if (need_motor(sh) || lockout_check(sh)) {
 		return -ENODEV;
 	}
 	stream_start(cur, 0);
@@ -891,6 +941,7 @@ static int cmd_velmode(const struct shell *sh, size_t argc, char **argv)
 		shell_error(sh, "enable failed: %d", ret);
 		return ret;
 	}
+	cur->energised = true;
 	cur->stream_kind = STREAM_VEL;
 	hb_rearm(cur);
 	stream_start(cur, hz_to_period(hz));
@@ -915,7 +966,7 @@ static int cmd_torquemode(const struct shell *sh, size_t argc, char **argv)
 
 	parse_mode_args(argc, argv, &save, &hz);
 
-	if (need_motor(sh)) {
+	if (need_motor(sh) || lockout_check(sh)) {
 		return -ENODEV;
 	}
 	stream_start(cur, 0);
@@ -944,6 +995,7 @@ static int cmd_torquemode(const struct shell *sh, size_t argc, char **argv)
 		shell_error(sh, "enable failed: %d", ret);
 		return ret;
 	}
+	cur->energised = true;
 	cur->stream_kind = STREAM_TORQUE;
 	hb_rearm(cur);
 	stream_start(cur, hz_to_period(hz));
@@ -987,7 +1039,7 @@ static int cmd_safevelmode(const struct shell *sh, size_t argc, char **argv)
 		cur->svel_runaway = false;
 	}
 
-	if (need_motor(sh)) {
+	if (need_motor(sh) || lockout_check(sh)) {
 		return -ENODEV;
 	}
 	stream_start(cur, 0);
@@ -1022,6 +1074,7 @@ static int cmd_safevelmode(const struct shell *sh, size_t argc, char **argv)
 		shell_error(sh, "enable failed: %d", ret);
 		return ret;
 	}
+	cur->energised = true;
 	if (cur->vel_pi.tor_max > cur->m.t_max) {
 		cur->vel_pi.tor_max = cur->m.t_max;
 	}
@@ -1179,6 +1232,31 @@ static int cmd_velsrc(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+static int cmd_lockout(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc > 1) {
+		if (!strcmp(argv[1], "on")) {
+			lockout = true;
+		} else if (!strcmp(argv[1], "off")) {
+			lockout = false;
+		} else {
+			shell_error(sh, "usage: dm lockout [on|off]");
+			return -EINVAL;
+		}
+	}
+	int n = 0;
+
+	for (int i = 0; i < DM_SLOTS; i++) {
+		if (slots[i].ready && (slots[i].energised || slots[i].stream_period_ms)) {
+			n++;
+		}
+	}
+	shell_print(sh, "single-motor lockout %s; %d motor(s) currently energised or streaming%s",
+		    lockout ? "ON" : "off", n,
+		    (lockout && n > 1) ? " (more than one: disable all but one)" : "");
+	return 0;
+}
+
 static int cmd_trace(const struct shell *sh, size_t argc, char **argv)
 {
 	if (argc > 1 && !strcmp(argv[1], "dump")) {
@@ -1316,7 +1394,7 @@ static int set_torque(const struct shell *sh, float tor)
 
 static int cmd_torque(const struct shell *sh, size_t argc, char **argv)
 {
-	if (need_motor(sh)) {
+	if (need_motor(sh) || lockout_check(sh)) {
 		return -ENODEV;
 	}
 	if (argc != 2) {
@@ -1328,7 +1406,7 @@ static int cmd_torque(const struct shell *sh, size_t argc, char **argv)
 
 static int cmd_current(const struct shell *sh, size_t argc, char **argv)
 {
-	if (need_motor(sh)) {
+	if (need_motor(sh) || lockout_check(sh)) {
 		return -ENODEV;
 	}
 	if (argc != 2) {
@@ -1417,7 +1495,7 @@ static int cmd_status(const struct shell *sh, size_t argc, char **argv)
 
 static int cmd_psi(const struct shell *sh, size_t argc, char **argv)
 {
-	if (need_motor(sh)) {
+	if (need_motor(sh) || lockout_check(sh)) {
 		return -ENODEV;
 	}
 	if (argc != 4) {
@@ -1429,6 +1507,11 @@ static int cmd_psi(const struct shell *sh, size_t argc, char **argv)
 
 static int cmd_cur3519(const struct shell *sh, size_t argc, char **argv)
 {
+	if (lockout) {
+		shell_error(sh, "lockout: the one-to-four frame drives up to four motors at once; "
+			    "'dm lockout off' first");
+		return -EBUSY;
+	}
 	float cur[4] = {0};
 
 	if (argc < 2 || argc > 6) {
@@ -1836,6 +1919,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	dm_cmds,
 	SHELL_CMD_ARG(init, NULL, "<esc_id> [mst_id = esc+0x10] [pmax vmax tmax]: select a motor (set it up the first time)", cmd_init, 1, 5),
 	SHELL_CMD(motors, NULL, "list the motors in use and what each is doing", cmd_motors),
+	SHELL_CMD_ARG(lockout, NULL, "[on|off]: allow only one motor to be energised at a time (default on)", cmd_lockout, 1, 1),
 	SHELL_CMD_ARG(release, NULL, "[esc_id]: stop, disable and forget a motor", cmd_release, 1, 1),
 	SHELL_CMD_ARG(mode, NULL, "[mit|pos|vel|psi]: frame-ID mode used by enable/disable/zero", cmd_mode, 1, 1),
 	SHELL_CMD(enable, NULL, "enable motor (FF..FC)", cmd_enable),

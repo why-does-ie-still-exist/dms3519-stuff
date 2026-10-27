@@ -94,6 +94,14 @@ it refuses to start if a stale `screen` still holds the port.
 
 ### Several motors at once
 
+**Single-motor lockout (default on).** While the motors share one thin supply
+lead, only one may be energised at a time: `dm enable`, the mode commands and
+the one-shot drive commands are refused while another slot is enabled or
+streaming, naming the motor in the way. `dm disable`, `dm stop` + `dm stream 0`
+or `dm release` on that motor clears it. `dm lockout off` lifts the rule once
+the wiring can carry the current; `dm lockout` shows the state.
+
+
 Each motor gets its own slot with its own control loop, so `dm init` is really
 "select": the first `dm init 3` sets the motor up, a later `dm init 3` just
 switches the shell's commands back to it and leaves it (and every other motor)
