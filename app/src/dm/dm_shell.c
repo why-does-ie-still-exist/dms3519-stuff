@@ -59,10 +59,51 @@ static bool svel_deadband_user;
 static uint32_t stream_count;
 static uint8_t last_state = 0xFF;
 
+/*
+ * Host heartbeat watchdog.  The streamer keeps sending the last setpoint on
+ * its own, so if the host driving it dies mid-move (killed, hung, unplugged
+ * from the network) the motor would keep turning.  With the watchdog armed,
+ * the host must send 'dm hb' at least every hb_timeout_ms; otherwise the
+ * streamer zeroes everything, disables the driver and stops.  Checked in
+ * stream_fn, so it runs on the MCU with no help from the host.
+ *
+ * 32-bit uptime so the shell thread's writes and the work queue's reads
+ * cannot tear; unsigned subtraction handles the wrap.
+ */
+static uint32_t hb_timeout_ms; /* 0 = watchdog off */
+static uint32_t hb_last_ms;
+static bool hb_tripped;
+
+/* Any mode bring-up re-arms: the operator is clearly back in control. */
+static void hb_rearm(void)
+{
+	hb_last_ms = k_uptime_get_32();
+	hb_tripped = false;
+}
+
+static void hb_trip(void)
+{
+	stream_period_ms = 0; /* stream_fn returns without rescheduling */
+	vel_setpoint = 0.0f;
+	vel_current = 0.0f;
+	tor_setpoint = 0.0f;
+	tor_current = 0.0f;
+	svel_idle = true;
+	dm_vel_pi_reset(&vel_pi);
+	(void)dm_motor_mit(&motor, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+	(void)dm_motor_disable(&motor, cur_mode);
+	hb_tripped = true;
+	printk("dm: no host heartbeat for %u ms, motor disabled\n", hb_timeout_ms);
+}
+
 static void stream_fn(struct k_work *work)
 {
 	ARG_UNUSED(work);
 	if (stream_period_ms == 0 || !motor_ready) {
+		return;
+	}
+	if (hb_timeout_ms && (uint32_t)(k_uptime_get_32() - hb_last_ms) > hb_timeout_ms) {
+		hb_trip();
 		return;
 	}
 	if (vel_ramp > 0.0f) {
@@ -452,6 +493,7 @@ static int cmd_velmode(const struct shell *sh, size_t argc, char **argv)
 		return ret;
 	}
 	stream_kind = STREAM_VEL;
+	hb_rearm();
 	stream_start(hz ? 1000 / hz : 0);
 	shell_print(sh, "velocity mode: enabled on ID 0x%03x, streaming at %u Hz; use 'dm vel <rad/s>'",
 		    DM_ID_VEL + motor.esc_id, hz);
@@ -498,6 +540,7 @@ static int cmd_torquemode(const struct shell *sh, size_t argc, char **argv)
 		return ret;
 	}
 	stream_kind = STREAM_TORQUE;
+	hb_rearm();
 	stream_start(hz ? 1000 / hz : 0);
 	shell_print(sh, "torque mode: MIT on ID 0x%03x, Kp=Kd=0, streaming at %u Hz, ramp %.1f N.m/s, "
 		    "speed cap %.1f rad/s; use 'dm torque <Nm>' or 'dm current <A>'",
@@ -570,6 +613,7 @@ static int cmd_safevelmode(const struct shell *sh, size_t argc, char **argv)
 		vel_pi.deadband = DM_VEL_DEADBAND(motor.v_max);
 	}
 	stream_kind = STREAM_SAFEVEL;
+	hb_rearm();
 	stream_start(hz ? 1000 / hz : 0);
 	shell_print(sh, "safe velocity mode: MIT on ID 0x%03x, streaming at %u Hz, ramp %.1f rad/s^2",
 		    DM_ID_MIT + motor.esc_id, hz, (double)vel_ramp);
@@ -615,6 +659,39 @@ static int cmd_velgains(const struct shell *sh, size_t argc, char **argv)
 	}
 	shell_print(sh, "safevel gains: kp %.4f N.m per rad/s, ki %.4f N.m per rad",
 		    (double)vel_pi.kp, (double)vel_pi.ki);
+	return 0;
+}
+
+static int cmd_watchdog(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc > 1) {
+		hb_timeout_ms = argu(argv[1]);
+		/* Restart the clock so arming does not trip at once, but leave a
+		 * trip in place: only a mode command restarts the stream and
+		 * re-enables the driver, so clearing the flag here would report
+		 * "ok" while the motor sits disabled.
+		 */
+		hb_last_ms = k_uptime_get_32();
+	}
+	if (hb_timeout_ms) {
+		shell_print(sh, "watchdog %u ms: 'dm hb' must arrive this often or the motor is "
+			    "disabled%s", hb_timeout_ms, hb_tripped ? " [TRIPPED]" : "");
+	} else {
+		shell_print(sh, "watchdog off");
+	}
+	return 0;
+}
+
+/* Sent several times a second by the host, so keep the reply short. */
+static int cmd_hb(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	hb_last_ms = k_uptime_get_32();
+	/* A late heartbeat does not undo a trip: the motor stays disabled
+	 * until a mode command re-enables it.
+	 */
+	shell_print(sh, hb_tripped ? "hb TRIPPED" : "hb ok");
 	return 0;
 }
 
@@ -753,6 +830,11 @@ static int cmd_status(const struct shell *sh, size_t argc, char **argv)
 		shell_print(sh, "stream %s %u ms (velocity), sent %u, setpoint %.3f, sending %.3f rad/s",
 			    stream_period_ms ? "on" : "off", stream_period_ms, stream_count,
 			    (double)vel_setpoint, (double)vel_current);
+	}
+	if (hb_timeout_ms) {
+		shell_print(sh, "watchdog %u ms, last hb %u ms ago%s", hb_timeout_ms,
+			    (uint32_t)(k_uptime_get_32() - hb_last_ms),
+			    hb_tripped ? " [TRIPPED]" : "");
 	}
 	return cmd_fb(sh, 0, NULL);
 }
@@ -996,6 +1078,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD_ARG(torquecap, NULL, "[N.m]: show/set the safevel torque cap (saturates, no trip)", cmd_torquecap, 1, 1),
 	SHELL_CMD_ARG(velgains, NULL, "[kp] [ki]: show/set the safevel velocity-loop gains", cmd_velgains, 1, 2),
 	SHELL_CMD_ARG(veldeadband, NULL, "[rad/s]: velocity error the safevel loop ignores (quantisation)", cmd_veldeadband, 1, 1),
+	SHELL_CMD_ARG(watchdog, NULL, "[ms]: disable the motor if no 'dm hb' arrives within ms (0 = off)", cmd_watchdog, 1, 1),
+	SHELL_CMD(hb, NULL, "host heartbeat for the watchdog", cmd_hb),
 	SHELL_CMD(status, NULL, "motor, streamer and feedback status", cmd_status),
 	SHELL_CMD_ARG(psi, NULL, "<pos> <vel> <cur>: force-position frame", cmd_psi, 4, 0),
 	SHELL_CMD_ARG(cur3519, NULL, "<m1> [m2] [m3] [m4]: DM3519 one-to-four current frame (A)", cmd_cur3519, 2, 3),
