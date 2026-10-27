@@ -238,6 +238,65 @@ static void test_vel_pi_deadband(void)
 	      (double)outside);
 }
 
+static void test_vel_pi_friction(void)
+{
+	const float dt = 0.001f;
+	struct dm_vel_pi pi = {
+		.kp = 0.3f, .ki = 1.0f, .tor_max = 2.0f, .deadband = 0.147f,
+		.ff = 0.12f, .ff_taper = 0.2f, .i_max = 0.15f, .ff_brk = 0.34f, .stick_ms = 20.0f,
+		.stick_v = 0.05f,
+	};
+	float tor = 0.0f;
+
+	/* Commanded 0.5, shaft reading "zero" (+half a count): kinetic ff at
+	 * once, kick only after stick_ms, integrator frozen while kicking.
+	 */
+	for (int i = 0; i < 19; i++) {
+		tor = dm_vel_pi_step(&pi, 0.5f, 0.049f, dt);
+		CHECK(!pi.kicking, "no kick before stick_ms (tick %d)", i);
+	}
+	CHECK(tor > 0.12f && tor < 0.34f, "ff + P + small I before kick: %f", (double)tor);
+	tor = dm_vel_pi_step(&pi, 0.5f, 0.049f, dt);
+	CHECK(pi.kicking, "kick after 20 ms stuck");
+	CHECK(tor > 0.46f, "kick adds breakaway torque: %f", (double)tor);
+	float integ_during_kick = pi.integ;
+
+	for (int i = 0; i < 50; i++) {
+		dm_vel_pi_step(&pi, 0.5f, 0.049f, dt);
+	}
+	CHECK(pi.integ == integ_during_kick, "integrator frozen while kicking");
+	/* A twitch inside the backlash (below the release speed) keeps the kick;
+	 * real motion (above 30% of the command) drops it on that very tick.
+	 */
+	tor = dm_vel_pi_step(&pi, 0.5f, 0.10f, dt);
+	CHECK(pi.kicking, "kick held through a backlash twitch");
+	tor = dm_vel_pi_step(&pi, 0.5f, 0.44f, dt);
+	CHECK(!pi.kicking, "kick dropped on motion");
+	CHECK(tor < 0.3f, "torque back near ff after breakaway: %f", (double)tor);
+	/* Integrator clamp holds below the torque cap. */
+	for (int i = 0; i < 2000; i++) {
+		dm_vel_pi_step(&pi, 0.5f, 0.3f, dt);
+	}
+	CHECK(pi.integ <= 0.15f + 1e-6f, "integrator clamped at i_max: %f", (double)pi.integ);
+	/* Negative direction mirrors. */
+	dm_vel_pi_reset(&pi);
+	for (int i = 0; i < 25; i++) {
+		tor = dm_vel_pi_step(&pi, -0.5f, -0.049f, dt);
+	}
+	CHECK(pi.kicking && tor < -0.46f, "negative kick: %f", (double)tor);
+	/* A command inside the taper (0.05 of 0.2) never counts as a move. */
+	dm_vel_pi_reset(&pi);
+	for (int i = 0; i < 100; i++) {
+		dm_vel_pi_step(&pi, 0.05f, 0.049f, dt);
+	}
+	CHECK(!pi.kicking, "no kick for a command inside the taper");
+	/* With the new fields zero the loop behaves as before: pure PI. */
+	struct dm_vel_pi plain = {.kp = 0.3f, .ki = 1.0f, .tor_max = 2.0f};
+
+	tor = dm_vel_pi_step(&plain, 1.0f, 0.0f, dt);
+	CHECK(fabsf(tor - (0.3f + 0.001f)) < 1e-5f, "plain PI unchanged: %f", (double)tor);
+}
+
 int main(void)
 {
 	test_float_uint_roundtrip();
@@ -246,6 +305,7 @@ int main(void)
 	test_dm3519();
 	test_vel_pi();
 	test_vel_pi_deadband();
+	test_vel_pi_friction();
 	if (failures == 0) {
 		printf("dm_motor host tests: all passed\n");
 		return 0;

@@ -279,7 +279,42 @@ struct dm_vel_pi {
 	float ki;       /* N.m per rad (i.e. per rad/s of error, per second) */
 	float tor_max;  /* N.m, symmetric clamp; 0 means no torque, not "unlimited" */
 	float deadband; /* rad/s of error ignored; 0 disables (see above) */
-	float integ;    /* state: the integrator's contribution, in N.m */
+	/*
+	 * Coulomb-friction feed-forward, N.m: added in the direction of the
+	 * commanded velocity so the integrator does not have to wind up to the
+	 * breakaway torque (and then overshoot while it unwinds).  Tapered to
+	 * zero over ff_taper rad/s of command so it cannot chatter around 0.
+	 */
+	float ff;
+	float ff_taper; /* rad/s; 0 means a hard sign() */
+	float i_max;    /* N.m, clamp on the integrator alone; 0 means tor_max */
+	/*
+	 * Breakaway kick: static friction is far above kinetic (0.34 vs 0.14 N.m
+	 * on an unloaded DM-S3519), and letting the integrator climb to it is
+	 * what causes the lurch.  Instead, once the shaft has read zero for
+	 * stick_ms while a move is commanded, add ff_brk on top; it vanishes on
+	 * the first tick that shows motion, and the integrator is frozen while
+	 * it is applied.
+	 */
+	float ff_brk;   /* N.m; 0 disables */
+	float stick_ms; /* how long "not moving" must last before the kick */
+	/*
+	 * "Not moving" is |v| < stick_v.  The kick itself twitches the rotor
+	 * inside the gearbox backlash, so once engaged it is only released when
+	 * |v| exceeds 2*stick_v or 30% of the command, whichever is larger.
+	 */
+	float stick_v;  /* rad/s; 0 falls back to the deadband */
+	/*
+	 * First-order low-pass on the measured velocity used for the error.  The
+	 * driver's estimate at 1 kHz jitters by a couple of counts, which the P
+	 * term would otherwise turn straight into torque noise.  0 = off.
+	 */
+	float tau_ms;
+	/* state */
+	float integ;    /* the integrator's contribution, in N.m */
+	float v_filt;   /* filtered measured velocity */
+	float stuck_ms; /* how long the shaft has read zero during a move */
+	bool kicking;   /* breakaway kick applied on the last step */
 };
 
 /** One count of feedback velocity, rad/s: the 12-bit field spans +-v_max. */
