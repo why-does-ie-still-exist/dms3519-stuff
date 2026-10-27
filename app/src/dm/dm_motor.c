@@ -260,6 +260,11 @@ int dm_motor_sync_limits(struct dm_motor *m, k_timeout_t timeout)
 	if (ret) {
 		return ret;
 	}
+	float gr;
+
+	if (dm_motor_read_reg_float(m, DM_RID_GR, &gr, timeout) == 0 && gr > 0.0f) {
+		m->gr = gr;
+	}
 	if (p > 0.0f && v > 0.0f && t > 0.0f) {
 		m->p_max = p;
 		m->v_max = v;
@@ -309,8 +314,25 @@ static void rx_feedback(const struct device *dev, struct can_frame *frame, void 
 	if (can_dlc_to_bytes(frame->dlc) < 8) {
 		return;
 	}
+	float prev = m->fb.pos;
+	bool had = m->fb.valid;
+
 	dm_unpack_feedback(frame->data, m->p_max, m->v_max, m->t_max, &m->fb);
+	if (had) {
+		float d = m->fb.pos - prev;
+
+		/* Wrap at +-PMAX: a jump of more than PMAX is a wrap, not motion. */
+		if (d > m->p_max) {
+			d -= 2.0f * m->p_max;
+		} else if (d < -m->p_max) {
+			d += 2.0f * m->p_max;
+		}
+		m->fb.pos_unw += d;
+	} else {
+		m->fb.pos_unw = 0.0f;
+	}
 	m->fb.stamp = k_uptime_get();
+	m->fb.stamp_cyc = k_cycle_get_32();
 }
 
 static void rx_3519(const struct device *dev, struct can_frame *frame, void *user_data)
@@ -359,6 +381,7 @@ int dm_motor_init(struct dm_motor *m, const struct device *can, uint16_t esc_id,
 	m->p_max = p_max;
 	m->v_max = v_max;
 	m->t_max = t_max;
+	m->gr = DM_S3519_GR;
 	k_sem_init(&m->reg_sem, 0, 1);
 	k_sem_init(&m->tx_sem, 0, 1);
 

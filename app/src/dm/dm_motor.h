@@ -145,6 +145,16 @@ struct dm_feedback {
 	float t_mos;     /* degC */
 	float t_coil;    /* degC */
 	int64_t stamp;   /* k_uptime_get() at reception */
+	/*
+	 * On the DM3520 driver the feedback position is the ROTOR angle
+	 * (wrapping at +-PMAX) while the velocity is at the output shaft: the
+	 * two differ by the gear ratio.  pos_unw accumulates the rotor angle
+	 * across wraps so a velocity can be differenced from it; at 16 bits over
+	 * 2*PMAX that is 0.0004 rad per count, two orders of magnitude finer
+	 * than the driver's own velocity estimate.
+	 */
+	float pos_unw;   /* rad, rotor, unwrapped */
+	uint32_t stamp_cyc; /* k_cycle_get_32() at reception, for differencing */
 	bool valid;
 };
 
@@ -168,6 +178,7 @@ struct dm_motor {
 	float p_max;      /* must match the motor's PMAX register */
 	float v_max;      /* VMAX */
 	float t_max;      /* TMAX */
+	float gr;         /* gear ratio (RID 20); rotor rad to output rad */
 	struct dm_feedback fb;
 	struct dm3519_feedback fb3519;
 	/*
@@ -189,6 +200,7 @@ struct dm_motor {
 #define DM_S3519_PMAX 12.5f
 #define DM_S3519_VMAX 200.0f
 #define DM_S3519_TMAX 10.0f
+#define DM_S3519_GR   19.2f
 /* DM-J4310-2EC, for comparison. */
 #define DM_J4310_PMAX 12.5f
 #define DM_J4310_VMAX 30.0f
@@ -208,8 +220,9 @@ int dm_motor_init(struct dm_motor *m, const struct device *can, uint16_t esc_id,
 void dm_motor_release(struct dm_motor *m);
 
 /**
- * Read PMAX/VMAX/TMAX (RIDs 0x15-0x17) from the driver and adopt them for the
- * MIT/feedback mapping.  Returns 0 if all three were read, else the error.
+ * Read PMAX/VMAX/TMAX (RIDs 0x15-0x17) and GR (RID 20) from the driver and
+ * adopt them for the MIT/feedback mapping.  Returns 0 if the three limits were
+ * read, else the error; GR falls back to the DM-S3519 value if unanswered.
  */
 int dm_motor_sync_limits(struct dm_motor *m, k_timeout_t timeout);
 
