@@ -10,3 +10,4 @@ bazel-*
 /.venv/
 /zephyr/
 /modules/
+__pycache__/
