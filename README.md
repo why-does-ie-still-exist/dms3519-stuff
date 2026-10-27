@@ -83,14 +83,45 @@ uv run python -c "import serial; s=serial.Serial('/dev/cu.usbmodem*',1200); s.dt
 ## Shell
 
 ```sh
-screen /dev/cu.usbmodem* 115200             # quit: Ctrl-A K
+tools/console.sh                            # finds the board's port, opens screen; quit: Ctrl-A K
+tools/console.sh --wait                     # wait for the board to enumerate (after a flash)
 uv run tools/console.py --seconds 30        # or: capture-only
 ```
+
+`console.sh` looks for the `/dev/serial/by-id/*CANBed*` link on Linux and
+`/dev/cu.usbmodem*` on macOS, so it works whatever number the tty gets, and
+it refuses to start if a stale `screen` still holds the port.
+
+### Several motors at once
+
+Each motor gets its own slot with its own control loop, so `dm init` is really
+"select": the first `dm init 3` sets the motor up, a later `dm init 3` just
+switches the shell's commands back to it and leaves it (and every other motor)
+running. `dm motors` shows what each slot is doing; `dm release [esc]` stops,
+disables and forgets one. Loop settings such as `torquecap`, `velgains`,
+`watchdog` and `speedcap` are per motor, so select the motor before tuning it.
+
+```
+dm init 1          # select/set up motor 1
+dm safevelmode
+dm vel 0.5
+dm init 2          # motor 1 keeps going
+dm safevelmode
+dm vel -0.5
+dm motors          # * marks the selected one
+dm init 1          # back to motor 1, still at 0.5 rad/s
+dm stop
+```
+
+`dm init` warns when the driver's TIMEOUT register (rid 9) is 0: that motor
+holds its last command for ever if its frames stop, so the shell never leaves a
+motor's stream running unattended on purpose. `dm scan` and `set_can_id.py`
+refuse to run while any motor is streaming.
 
 ### Velocity control
 
 ```
-dm init 1 0        # ESC_ID 1, MST_ID 0; reads PMAX/VMAX/TMAX from the driver
+dm init 1          # ESC_ID 1, MST_ID 0x11 (esc + 0x10); 'dm init 1 0' to give MST_ID explicitly
 dm velmode         # CTRL_MODE=3, enable, stream setpoint at 100 Hz (add "save" to persist mode)
 dm vel 0.5         # rad/s at the output shaft, ramped at 2 rad/s^2
 dm status
@@ -103,14 +134,13 @@ dm disable
 Velocity control that cannot pull more than a set torque. Unlike `dm speedcap`
 in torque mode, hitting the cap is **not** a trip: a stalled motor pushes at
 exactly the cap and holds there, and goes back to tracking the setpoint by
-itself once the load is removed.
+itself once the load is removed. The loop runs on the MCU at 1 kHz.
 
 ```
-dm init 1 0
-dm torquecap 1.5   # N.m at the output shaft (default 2.0); 0 means no torque
-dm velgains 0.4 1.2  # optional: kp (N.m per rad/s), ki (N.m per rad)
-dm safevelmode     # MIT mode, MCU-side velocity loop, 100 Hz; starts idle
-dm vel 0.5         # rad/s, ramped by 'dm stream <hz> <ramp>'
+dm init 1
+dm torquecap 1.5   # N.m at the output shaft (default 0.5, fine unloaded); 0 means no torque
+dm safevelmode     # MIT mode, MCU-side velocity loop at 1 kHz; starts idle
+dm vel 0.5         # rad/s at the output shaft, ramped by 'dm stream <hz> <ramp>'
 dm status          # shows the torque being used and "[AT CAP]" when saturated
 dm stop            # idle: 0 N.m until the next 'dm vel'
 dm disable
@@ -118,36 +148,61 @@ dm disable
 
 `dm stop` idles the loop at zero torque rather than regulating to 0 rad/s. Those
 are different things: a zero-speed setpoint leaves the loop fighting feedback
-quantisation (below), which shows up as jitter at standstill. `dm vel 0` still
-asks for an actively braked zero if that is what you want.
+noise at standstill. `dm vel 0` still asks for an actively braked zero.
 
-The velocity loop runs on the MCU rather than in the driver, because the
-driver's own velocity mode (`dm velmode`, CTRL_MODE 3) will spend up to TMAX to
-hold a setpoint. Here a PI controller on velocity error produces a torque that
-is clamped to the cap and sent as a MIT frame with Kp = Kd = 0. Integration is
-suspended while clamped, so a long stall cannot wind the integrator up and
-lurch when the load clears.
+#### How the loop deals with friction (and why it does not lurch)
 
-Feedback cannot express zero velocity. The 12-bit field maps +-VMAX onto
-0..4095, so zero falls at code 2047.5 and a stationary motor reports
-+-VMAX/4095 (0.049 rad/s at VMAX 200) for ever. Left alone that constant
-apparent error ratchets the integrator up until it breaks stiction and the
-motor jitters, so error within `dm veldeadband` (default 1.5 counts, 0.147
-rad/s at VMAX 200) is ignored by both terms:
+An unloaded DM-S3519 needs about 0.34 N.m to break away but only 0.14 N.m to
+keep turning. A plain PI loop winds its integrator up to the breakaway torque,
+then carries that excess into the move and overshoots by 70% or more while it
+unwinds (measured with `tools/vel_step.py`). The loop therefore has:
+
+- a kinetic-friction feed-forward (default 0.14 N.m) in the direction of the
+  command, so the integrator only carries the residual;
+- a breakaway kick (default 0.34 N.m) applied once the shaft has read
+  "not moving" for 20 ms while a move is commanded, dropped the moment the
+  shaft is clearly moving, with the integrator frozen while it is applied;
+- an integrator clamp (default 0.15 N.m) well below the torque cap;
+- an independent runaway guard on the driver's own velocity: if it exceeds
+  1.5x the setpoint plus 1 rad/s the loop idles at 0 N.m and says so, since
+  that means the estimator below has lost the plot;
+- velocity derived from the **rotor position** rather than the driver's own
+  velocity estimate. On this driver the feedback position is the rotor angle
+  while the velocity is at the output shaft; differencing the rotor angle over
+  10 ms and dividing by the gear ratio (register 20, 19.2) gives a velocity
+  that reads 0 +- 0.004 rad/s at rest, against +-0.15 rad/s of jitter in the
+  driver's estimate at any VMAX. The window is a time, so the estimate is
+  marked invalid (loop open, 0 N.m) whenever feedback is missing from it;
+  `dm safevelmode` refuses rates below 200 Hz for the same reason.
+
+Measured result at 0.5 rad/s, unloaded: breakaway in 0.08 s with the
+integrator at 0.008 N.m, overshoot about +10% on a 50 ms average, settled in
+0.4 s, steady error under 0.01 rad/s. The remaining +-0.1 rad/s raw ripple is
+real shaft motion: cogging at about 40 Hz. Below about 0.3 rad/s the unloaded
+motor stick-slips; a load damps that.
 
 ```
-dm veldeadband       # show, in rad/s and in feedback counts
-dm veldeadband 0.05  # override; warns below one count
+dm velgains 0.3 2.0        # kp (N.m per rad/s), ki (N.m per rad)
+dm velff 0.14 0.34 0.15    # kinetic ff, breakaway kick, integrator clamp (N.m)
+dm velfilt 3 20 0.2 0.05   # velocity filter ms, ms stuck before kick, ff taper rad/s, stuck threshold rad/s
+dm velsrc pos 10           # velocity from rotor position over 10 ms ('fb' = driver estimate)
+dm veldeadband 0.01        # velocity error ignored
 ```
 
-The cost is up to one deadband of steady-state speed error. Lowering VMAX
-(RID 22) shrinks the quantisation step and the deadband together and is the
-real fix if you care about slow speeds; it also rescales the MIT velocity
-field, so re-run `dm init` afterwards.
+#### Measuring a step response
 
-Tuning notes: the default gains are deliberately soft and assume the output
-shaft, so expect to raise `kp` for stiffer tracking. If feedback stops for
-100 ms the loop opens and commands 0 N.m.
+```sh
+uv run tools/vel_step.py 1 --vel 0.5                 # step motor 1 to 0.5 rad/s, print metrics
+uv run tools/vel_step.py 1 --vel 0.5 --ff 0.1 --brk 0 --csv step.csv
+uv run tools/vel_step.py 1 --vel -0.5 --velsrc fb     # compare with the driver's velocity
+```
+
+The firmware captures the loop to RAM at full rate (`dm trace <n>`, then
+`dm trace dump` for CSV: time, ramped command, velocity used, driver velocity,
+torque, integrator, state, rotor position), so the measurement never competes
+with the loop for time. The script reports breakaway time and torque, overshoot
+and settling on a 50 ms average, steady-state error and the driver's own
+velocity noise for comparison.
 
 ### Torque / current control
 
@@ -166,6 +221,18 @@ dm disable
 `dm pos <pos> <vel>`, `dm bus normal|loopback [fd]`, `dm fb`, `can ...` (Zephyr CAN shell).
 
 ## Notes
+
+- The SAM E5x CAN controller reaches its message RAM through 16-bit offsets, so
+  the driver's message-RAM buffer must stay in the first 64 KiB of SRAM. Big
+  application buffers go in the `.dm_trace` section (`app/linker/dm_trace.ld`),
+  which is placed after it; a large ordinary static array silently kills CAN
+  (frames never leave the controller, error counters stay at 0).
+- Both motors have TIMEOUT (register 9) saved as 2000. The unit is 50 us
+  (measured: 200 tripped between 10 and 20 ms of frame spacing), so 2000 is
+  100 ms: the driver itself disables a motor whose command frames stop, and it
+  tolerates streams down to about 20 Hz. The trip is a latched fault (state
+  0xD, "comm lost") that the mode commands clear before enabling. With the
+  factory value 0 a motor holds its last torque for ever.
 
 - Bus: 1 Mbit/s CAN 2.0. Driver register CAN_BR (RID 35) > 4 switches it to CAN FD
   with BRS; then `dm bus normal fd` and match `bitrate-data` in the board dts.
